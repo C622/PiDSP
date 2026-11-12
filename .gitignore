@@ -1,0 +1,41 @@
+# --- Private / AI assistant files (kept out of the public repo) ---
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+conversations/
+notes/private/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# --- Node / web UI ---
+node_modules/
+web/dist/
+
+# --- Image build output ---
+image/work/
+image/deploy/
+*.img
+*.img.xz
+*.zip
+
+# --- Measurement data & generated filters (local only) ---
+measurements/
+*.wav
+!tests/fixtures/**/*.wav
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.env
