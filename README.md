@@ -15,7 +15,7 @@ PiDSP turns a headless Raspberry Pi into a room-correction DSP. It uses [Camilla
 - **Easy install**: a ready-made SD/eMMC image published under GitHub Releases.
 - **Self-updating**: the web UI can update PiDSP to the latest GitHub release.
 
-Inspired by [moOde audio](https://moodeaudio.org/), which also ships a ready-to-flash Raspberry Pi image built around CamillaDSP.
+Inspired by [moOde audio](https://moodeaudio.org/), which also ships a ready-to-flash Raspberry Pi image built around CamillaDSP. The measurement and filter-fitting core comes from [omarchy-camilladsp](https://github.com/C622/omarchy-camilladsp), a desktop CamillaDSP calibrator by the same author.
 
 ## How it works
 
@@ -57,6 +57,7 @@ The development and test setup:
 | Computer | Raspberry Pi CM4 (32 GB eMMC) on a DFRobot PiTray mini |
 | Sound card | CM6206-based USB card (budget, for testing; a better card can come later) |
 | Microphone | miniDSP UMIK-1 |
+| Source | Apple TV 4K (2nd gen), via the TV |
 | Amplifier / streamer | Bluesound Powernode 2i HDMI |
 | Front speakers | DALI Rubicon LCR (pair) |
 | Subwoofer | B&W DB4S |
@@ -74,7 +75,7 @@ The development and test setup:
 
 ## Development
 
-The Pi runs headless. During development, code is deployed to it over SSH. Setup instructions will be added once the bring-up phase is done.
+The Pi runs headless. During development, code is deployed to it over SSH. See [docs/BRINGUP.md](docs/BRINGUP.md) to get a Pi to that point.
 
 ## License
 

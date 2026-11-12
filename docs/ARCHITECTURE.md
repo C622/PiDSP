@@ -8,7 +8,7 @@ This is a living document. Decisions marked **(proposed)** are open for change.
 |---|---|---|
 | OS | Raspberry Pi OS Lite, 64-bit **(proposed)** | Headless. Same base moOde uses. |
 | DSP engine | CamillaDSP | Runs as a systemd service and is controlled over its websocket API. |
-| Backend | Python (FastAPI) **(proposed)** | Measurement, analysis, filter generation and CamillaDSP control (`pycamilladsp`). NumPy/SciPy for DSP. |
+| Backend | Python (FastAPI) **(proposed)** | Measurement, analysis, filter generation and CamillaDSP control (`pycamilladsp`). NumPy/SciPy for DSP. The DSP core comes from omarchy-camilladsp (see below). |
 | Frontend | Lightweight SPA, served by the backend **(proposed)** | Measurement wizard and plots. |
 | Image build | `pi-gen` in GitHub Actions **(proposed)** | Outputs a flashable `.img.xz` attached to GitHub Releases. |
 | Updates | GitHub Releases API | The web UI checks for the latest release, downloads it, swaps it in and restarts the service. Rollback keeps the previous version. |
@@ -35,19 +35,66 @@ This is a living document. Decisions marked **(proposed)** are open for change.
   - output is a minimum-phase or mixed-phase FIR, 48 kHz, 16k–64k taps, saved as `.wav` for CamillaDSP's `Conv` filter.
 - **Latency**: FIR length and phase type set the latency. This matters for TV use (lip sync), so offer a "low-latency" mode with shorter, minimum-phase filters.
 
-## Signal chain: open question for the reference setup
+## Signal chain for the reference setup
 
-The Bluesound Powernode 2i HDMI is an integrated streamer and amp with its own sub output and bass management. For PiDSP to control the crossover and time alignment, both the mains and the sub must pass through the Pi. Options:
+**Source:** Apple TV 4K (2nd gen). It is the only source, and it has HDMI output only. Lip sync is handled at the end by the Apple TV's own *Wireless Audio Sync* (calibrated with an iPhone), which measures the whole chain's delay. PiDSP therefore doesn't have to keep latency low, but the latency must stay **fixed** after calibration. Changing filter length or phase type means recalibrating.
 
-| Option | Chain | Pros | Cons |
-|---|---|---|---|
-| A | TV → (optical) → Pi → analog L/R → Powernode analog in (full-range, sub out off); Pi → analog sub out → DB4S | PiDSP controls everything | Extra AD/DA step in the Powernode. Streaming on the Powernode itself bypasses the Pi. |
-| B | Powernode → sub out → Pi → DB4S (sub only) | Simple, keeps the Powernode as the source | No correction of the mains. Limited time alignment. |
-| C | Source → Pi → digital out → Powernode (optical) | Single digital path | Needs a card with S/PDIF out. The Powernode still applies its own sub crossover. |
+**Chain (agreed):**
 
-The DB4S also has its own app-based room EQ and DSP. That should be set flat/bypassed while PiDSP is in control.
+```
+Apple TV ──HDMI──► TCL C8K ──optical (PCM stereo)──► Pi / CM6206 S/PDIF in
+                                                    │ CamillaDSP
+                                       ┌────────────┴────────────┐
+                              analog L/R out              analog sub out
+                                       ▼                         ▼
+                          Powernode 2i analog in            B&W DB4S line in
+                          (sub out unused, full range)
+```
 
-To verify on the CM6206: S/PDIF input capture under ALSA, multichannel analog output mapping, and the supported sample rates (48 kHz).
+- The TV (TCL C8K, 2025) has an optical output. It must be set to **PCM stereo**, not Dolby/DTS bitstream. 2.1 is derived from stereo in CamillaDSP.
+- Bass management on the Powernode and room EQ on the DB4S are switched off or flat. PiDSP handles the crossover, delay and EQ.
+- **Volume control is the main problem.** If the Powernode sets the volume, only the mains follow it, and the sub, fed directly from the Pi, would not. Options:
+  1. **Follow the Powernode's volume** **(direction agreed, details open)**: PiDSP reads the volume through the BluOS HTTP API (port 11000, long-polling `/Status`) and applies the same change to the sub channel in CamillaDSP. The Powernode remote/app stays the volume control. The same volume reading can drive loudness compensation, as the Omarchy plugin's loudness-tracker does with the desktop volume.
+  2. Keep the Powernode at a fixed level and set the volume in CamillaDSP from the PiDSP web UI. This is simpler but less convenient.
+- **Alternatives to the optical input**, kept in case the TV's optical output is a problem:
+  - The Pi as an **AirPlay 2 receiver** (shairport-sync, as in moOde). The Apple TV streams straight to the Pi and compensates for the delay itself. This needs testing for video use.
+  - An HDMI audio extractor between the Apple TV and the TV.
+
+**To verify:**
+- S/PDIF capture from the CM6206 under ALSA, at 48 kHz.
+- Analog channel mapping for the sub output.
+- The TCL's optical output setting for PCM.
+- The BluOS volume API behaviour.
+
+## Prior work: omarchy-camilladsp
+
+[omarchy-camilladsp](https://github.com/C622/omarchy-camilladsp), by the same author, is a desktop CamillaDSP calibrator with a UMIK-1 measurement path that already works. PiDSP reuses its DSP core rather than starting again.
+
+**Reused from `lib/calibration_dsp.py`** (pure NumPy/SciPy, already has tests on a simulated speaker and room):
+- excitation: log sweeps plus a level probe, with automatic level choice
+- deconvolution by regularised spectral division against the exact digital sweep. Latency drops out, and arrival times within one recording are kept, which handles the separate USB clocks of the UMIK-1 and the sound card.
+- frequency-dependent windowing, noise floor and per-frequency SNR
+- UMIK-1 / REW calibration file parsing
+- averaging over several positions
+- target curves
+- cut-first PEQ fitting, minimum-phase FIR, and mixed-phase "room correction" timing FIR
+- L/R alignment
+- the safety budget
+- refusing bad measurements (clipping, silence, noisy room)
+
+**New in PiDSP:**
+- sub channel handling
+- crossover choice
+- sub delay and polarity, chosen from the sub + mains sum
+- ALSA playback/capture (no PipeWire on the Pi)
+- volume follow via BluOS
+- web UI
+- updater and image
+
+**Differences on an appliance:**
+- **CamillaDSP websocket.** The plugin runs CamillaDSP without its websocket, because on a shared desktop it is unauthenticated. On PiDSP the websocket binds to `127.0.0.1` only, and the web UI (the only thing exposed on the LAN) talks to it.
+- **Fixed latency.** The plugin's 50 ms room-correction latency is fine here because the Apple TV calibrates lip sync. It must just stay constant.
+- **Licence.** The plugin is MIT. Copied files keep their MIT notice inside this GPL-3.0 project, which MIT permits.
 
 ## Repository layout (planned)
 
