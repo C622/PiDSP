@@ -39,3 +39,6 @@ measurements/
 *.swp
 .DS_Store
 .env
+
+# --- Local working notes ---
+PiDSP-bringup-notes.md
