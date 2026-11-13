@@ -96,6 +96,23 @@ Apple TV ──HDMI──► TCL C8K ──optical (PCM stereo)──► Pi / CM
 - **Fixed latency.** The plugin's 50 ms room-correction latency is fine here because the Apple TV calibrates lip sync. It must just stay constant.
 - **Licence.** The plugin is MIT. Copied files keep their MIT notice inside this GPL-3.0 project, which MIT permits.
 
+## Calibration stages (as implemented in `backend/`)
+
+| Stage | Plays | CamillaDSP config | Code |
+|---|---|---|---|
+| A. Bass setup | sweeps on left, right, sub in turn, in one recording | `config.measure_raw()`: 3 loopback inputs straight to the outputs, no filters | `dsp/bass.py`: `complex_responses()`, `align()` |
+| B. Room correction | sweeps on input L, then input R, at 1–5 mic positions | `config.build(plan, measure_side=...)`: the full 2.1 plan, sub fed the measured side at 0 dB | `dsp/calibration.py` (ported): `analyze()`, `combine()`, `fit_fir()` / `timing_correction()` |
+| C. Check | the same as B, with the FIRs active | `config.build(plan, fir=..., measure_side=...)` | `dsp/calibration.py` |
+
+Design decisions:
+- **The measurement player writes to an ALSA loopback** (`snd-aloop`), and CamillaDSP captures from it during measurement. The sweeps then go through exactly the output path used for listening.
+- **The FIR goes before the mixer**, one per input channel, so the sub gets corrected bass as well. Each FIR is fitted on "that main + sub" as heard at the seat.
+- **In normal use the sub gets (L + R) / 2.** For mono bass, which is most bass, that is the full signal. So in stage B, the sub is fed the measured side at 0 dB. That way the correction is fitted for the level the sub really plays at.
+- **Sub delay and polarity** come from searching ±30 ms and both polarities for the best summation through the crossover band (fc/2 to 2·fc). Delays a period apart sum about as well at fc, so the tie-break is the candidate whose group delay at fc matches the mains'. Only earlier speakers are ever delayed.
+- **Crossover:** the lowest of 60–120 Hz that is at least 2 × the mains' in-room −6 dB point, kept below the sub's −6 dB point / 1.25.
+- **The sub's Volume filter listens to fader `Aux1`.** The BluOS follower sets Aux1 to (Powernode volume − volume at calibration).
+- **Unverified until the Pi is up:** the CM6206's ALSA card name, which output channel carries the sub (the config feeds both centre and LFE), its S/PDIF capture, and `camilladsp --check` on the generated configs.
+
 ## Repository layout (planned)
 
 ```

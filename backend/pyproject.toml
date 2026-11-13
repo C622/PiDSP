@@ -1,0 +1,20 @@
+[project]
+name = "pidsp"
+version = "0.0.1"
+description = "Automated room correction, subwoofer crossover and time alignment for CamillaDSP on Raspberry Pi"
+license = "GPL-3.0-only"
+requires-python = ">=3.11"
+dependencies = ["numpy", "scipy", "pyyaml"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pidsp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -77,6 +77,13 @@ The development and test setup:
 
 The Pi runs headless. During development, code is deployed to it over SSH. See [docs/BRINGUP.md](docs/BRINGUP.md) to get a Pi to that point.
 
+The DSP and config code is in `backend/` and tested on simulated speakers and rooms:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -e "backend[dev]"
+cd backend && ../.venv/bin/pytest
+```
+
 ## License
 
 [GPL-3.0](LICENSE), the same license as CamillaDSP and moOde.
