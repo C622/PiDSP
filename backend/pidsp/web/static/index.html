@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiDSP</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">
+    <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#F2A93B" stroke-width="2" stroke-linecap="round"><path d="M3 12h1M7 8v8M11 4v16M15 7v10M19 10v4"/></svg>
+    PiDSP
+  </a>
+  <nav class="nav" aria-label="Main">
+    <a href="#/" data-route="">Dashboard</a>
+    <a href="#/calibrate" data-route="calibrate">Calibrate</a>
+    <a href="#/filters" data-route="filters">Filters</a>
+    <a href="#/system" data-route="system">System</a>
+  </nav>
+  <div class="pill" id="pill" role="status" aria-live="polite"><span class="dot"></span><span>Connecting…</span></div>
+</header>
+<main id="view"></main>
+<script src="app.js"></script>
+</body>
+</html>

@@ -73,6 +73,12 @@ deploy/install-camilladsp.sh <user>@PiDSP.local
 
 This installs a pinned, checksum-verified CamillaDSP to `/usr/local/bin` and a `camilladsp` system user with `/var/lib/camilladsp`. It loads the ALSA loopback (`snd-aloop`, card `Loopback`) at boot, which carries measurement sweeps through CamillaDSP. It sets the CM6206 test card to its S/PDIF input with the output at 0 dB, and saves that. It also enables `camilladsp.service`, with the websocket on `127.0.0.1:1234` only, waiting for a config. The script is safe to re-run.
 
-## 5. Next
+## 5. PiDSP web interface
 
-The PiDSP backend and web UI will be installed by another script, once they exist.
+```sh
+deploy/install-web.sh <user>@PiDSP.local
+```
+
+This copies the backend to `/opt/pidsp/app` and runs it as `pidsp-web.service` on port 80. Open **http://PiDSP.local**. Python dependencies come from Debian packages, so nothing is compiled on the Pi. The service runs as an unprivileged `pidsp-web` user. The only thing it may run as root is `/usr/local/sbin/pidsp-admin`, which can change the login password, restart or shut down. Re-run the script to deploy new code.
+
+There is no login on the web interface, as with moOde. Keep PiDSP on your home network; don't expose it to the internet.

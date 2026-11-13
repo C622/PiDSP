@@ -1,0 +1,2 @@
+# Installed as /etc/sudoers.d/020_pidsp-web
+pidsp-web ALL=(root) NOPASSWD: /usr/local/sbin/pidsp-admin

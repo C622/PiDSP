@@ -1,20 +1,26 @@
 [project]
 name = "pidsp"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Automated room correction, subwoofer crossover and time alignment for CamillaDSP on Raspberry Pi"
 license = "GPL-3.0-only"
 requires-python = ">=3.11"
-dependencies = ["numpy", "scipy", "pyyaml"]
+dependencies = ["numpy", "scipy", "pyyaml", "fastapi", "uvicorn", "websockets"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "httpx"]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.dynamic]
+version = {attr = "pidsp.__version__"}
+
 [tool.setuptools.packages.find]
 include = ["pidsp*"]
+
+[tool.setuptools.package-data]
+"pidsp.web" = ["static/*", "static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,17 @@
+[Unit]
+Description=PiDSP web interface
+After=network-online.target camilladsp.service
+Wants=network-online.target
+
+[Service]
+User=pidsp-web
+Group=pidsp-web
+SupplementaryGroups=audio camilladsp
+Environment=PYTHONPATH=/opt/pidsp/app
+ExecStart=/usr/bin/python3 -m uvicorn pidsp.web.app:app --host 0.0.0.0 --port 80 --no-access-log
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
