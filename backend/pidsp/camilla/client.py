@@ -75,9 +75,23 @@ class CamillaClient:
             "clipped_samples": v["GetClippedSamples"],
         }
 
-    async def levels(self) -> dict | None:
-        """Peak and RMS levels in dBFS since the last call, or None if unavailable."""
+    async def probe(self) -> dict | None:
+        """State, config path and latest levels in one connection (for watchers
+        that ask often). None if CamillaDSP does not answer."""
         try:
-            return await self.call("GetSignalLevelsSinceLast")
+            r = await self._session([("GetState", None), ("GetConfigFilePath", None), ("GetSignalLevels", None)])
+        except (OSError, asyncio.TimeoutError, websockets.WebSocketException):
+            return None
+        val = lambda k: None if isinstance(r.get(k), CamillaError) else r.get(k)
+        return {"state": val("GetState"), "config_path": val("GetConfigFilePath"), "levels": val("GetSignalLevels")}
+
+    async def levels(self) -> dict | None:
+        """Peak and RMS levels in dBFS of the latest chunk, or None if unavailable.
+
+        Not GetSignalLevelsSinceLast: CamillaDSP keeps "since last" per
+        websocket connection, and every call here opens a new one, so that
+        always came back empty."""
+        try:
+            return await self.call("GetSignalLevels")
         except (CamillaError, OSError, asyncio.TimeoutError, websockets.WebSocketException):
             return None

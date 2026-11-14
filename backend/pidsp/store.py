@@ -9,6 +9,8 @@ Layout (root defaults to /var/lib/pidsp, the service's StateDirectory):
   room/build.json       the last correction built from them (curves, preamp)
   room/fir_<side>.npy   its FIR taps
   active.json           what is applied, and when
+  settings.json         listener settings: sub level, volume following
+  check/latest.json     the last check measurement (stage C)
 CamillaDSP configs go to <camilla_dir>/configs/.
 """
 
@@ -30,7 +32,18 @@ from .dsp import calibration as cal
 STATE_DIR = Path(os.environ.get("PIDSP_STATE", "/var/lib/pidsp"))
 CAMILLA_DIR = Path(os.environ.get("PIDSP_CAMILLA_DIR", "/var/lib/camilladsp"))
 ACTIVE_CONFIG = "active.yml"
+# The applied bass setup without the room correction FIRs (but with the same
+# preamp, so a comparison is not just a level difference): for A/B listening.
+COMPARE_CONFIG = "compare.yml"
+LISTENING_CONFIGS = (ACTIVE_CONFIG, COMPARE_CONFIG)
 MAX_MIC_FILE = 1_000_000
+SETTINGS_DEFAULTS = {
+    "sub_level_db": 0.0,      # the listener's sub level, on top of the calibration
+    "follow_volume": True,    # move the sub with the amplifier's volume
+    "bluos_host": None,       # the amplifier (BluOS player) to follow, IP or name
+    "reference_db": None,     # the amplifier's volume (dB) when the bass was measured
+    "reference_volume": None, # the same, 0-100
+}
 
 
 def write_atomic(path: Path, data: str | bytes) -> None:
@@ -66,6 +79,20 @@ class Store:
             return json.loads((self.root / rel).read_text())
         except (OSError, ValueError):
             return None
+
+    # ---- settings ----
+
+    def settings(self) -> dict:
+        saved = self._json("settings.json") or {}
+        return {**SETTINGS_DEFAULTS, **{k: v for k, v in saved.items() if k in SETTINGS_DEFAULTS}}
+
+    def save_settings(self, **changes) -> dict:
+        unknown = set(changes) - set(SETTINGS_DEFAULTS)
+        if unknown:
+            raise KeyError(f"unknown settings: {', '.join(sorted(unknown))}")
+        merged = {**self.settings(), **changes}
+        write_atomic(self.root / "settings.json", json.dumps(merged, indent=1))
+        return merged
 
     # ---- microphone calibration ----
 
@@ -118,6 +145,19 @@ class Store:
     def bass(self) -> dict | None:
         return self._json("bass/latest.json")
 
+    def bass_responses(self) -> list[dict] | None:
+        """The complex responses saved with the last bass measurement."""
+        try:
+            with np.load(self.root / "bass/latest.npz") as z:
+                return [{"h": h, "arrival": float(a), "snr": s} for h, a, s in zip(z["h"], z["arrival"], z["snr"])]
+        except (OSError, KeyError, ValueError):
+            return None
+
+    def update_bass(self, result: dict) -> dict:
+        """Replace the last bass result (e.g. another crossover), same measurement."""
+        write_atomic(self.root / "bass/latest.json", json.dumps(result, indent=1))
+        return result
+
     # ---- room correction ----
 
     def save_position(self, index: int, measurement: dict, plan: dict, selftest: bool) -> dict:
@@ -166,24 +206,55 @@ class Store:
         cfg = cfgmod.build(plan, hardware=hardware, title="PiDSP: bass setup")
         return self._apply(cfg, {"kind": "bass", "plan": plan})
 
+    def write_room_firs(self, prefix: str = "room") -> dict:
+        """The last room build's FIRs as float32 WAVs CamillaDSP can load.
+        Returns {side: path}."""
+        filters = self.camilla_dir / "filters"
+        fir = {}
+        for side in ("left", "right"):
+            taps = np.load(self.root / f"room/fir_{side}.npy")
+            path = filters / f"{prefix}_{side}.wav"
+            buf = io.BytesIO()
+            wavfile.write(buf, cal.FS, taps.astype(np.float32))
+            write_atomic(path, buf.getvalue())
+            fir[side] = str(path)
+        return fir
+
     def apply_room(self, hardware: dict | None = None) -> Path:
         """Write the listening config for the last room build (bass plan + FIRs)."""
         build = self.room_build()
         if not build:
             raise ValueError("Build the room correction first.")
-        filters = self.camilla_dir / "filters"
-        fir = {}
-        for side in ("left", "right"):
-            taps = np.load(self.root / f"room/fir_{side}.npy")
-            path = filters / f"room_{side}.wav"
-            buf = io.BytesIO()
-            wavfile.write(buf, cal.FS, taps.astype(np.float32))
-            write_atomic(path, buf.getvalue())
-            fir[side] = str(path)
+        fir = self.write_room_firs("room")
         cfg = cfgmod.build(build["plan"], fir=fir, preamp_db=build["preamp_db"], hardware=hardware,
                            title="PiDSP: bass setup and room correction")
         return self._apply(cfg, {"kind": "room", "plan": build["plan"], "room": {
-            k: build[k] for k in ("target", "positions", "preamp_db", "sides", "curves")}})
+            k: build[k] for k in ("target", "positions", "preamp_db", "sides", "curves", "built") if k in build}})
 
     def active(self) -> dict | None:
         return self._json("active.json")
+
+    def write_compare(self, hardware: dict | None = None) -> Path:
+        """The applied room correction's bass setup without the FIRs, at the
+        same preamp, for comparing by ear. Returns its path."""
+        active = self.active() or {}
+        if active.get("kind") != "room":
+            raise ValueError("Apply a room correction first.")
+        cfg = cfgmod.build(active["plan"], preamp_db=active["room"]["preamp_db"], hardware=hardware,
+                           title="PiDSP: bass setup, room correction off (comparison)")
+        problems = cfgmod.problems(cfg)
+        if problems:
+            raise ValueError("; ".join(problems))
+        path = self.config_dir / COMPARE_CONFIG
+        write_atomic(path, cfgmod.to_yaml(cfg))
+        return path
+
+    # ---- check (stage C) ----
+
+    def save_check(self, result: dict) -> dict:
+        result = {**result, "measured": _now()}
+        write_atomic(self.root / "check/latest.json", json.dumps(result))
+        return result
+
+    def check(self) -> dict | None:
+        return self._json("check/latest.json")

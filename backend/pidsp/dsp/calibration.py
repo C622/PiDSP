@@ -78,13 +78,19 @@ def sweep(seconds=SWEEP_SECONDS, f1=F_LOW / 2, f2=F_HIGH * 1.1, fs=FS):
     return x
 
 
-def excitation(channels=2, repeats=3, level_db=-20.0, fs=FS):
+def excitation(channels=2, repeats=3, level_db=-20.0, fs=FS, bands=None):
     """The whole playback: lead-in silence, then each channel in turn, repeated.
 
+    level_db is one level for all channels or one per channel; bands, if
+    given, is a (f1, f2) sweep range per channel (None for the full range).
+    Every sweep has the same length.
     Returns the stereo signal and a schedule of (channel, repeat, start) with
     start in samples from the beginning of the playback.
     """
-    s = sweep(fs=fs) * 10 ** (level_db / 20)
+    levels = np.broadcast_to(np.asarray(level_db, dtype=np.float64), (channels,))
+    bands = list(bands) if bands is not None else [None] * channels
+    sweeps = [sweep(fs=fs) if b is None else sweep(f1=b[0], f2=b[1], fs=fs) for b in bands]
+    s = sweeps[0]
     lead, gap = int(LEAD_SECONDS * fs), int(GAP_SECONDS * fs)
     order = [(ch, r) for r in range(repeats) for ch in range(channels)]
     total = lead + len(order) * (len(s) + gap)
@@ -92,32 +98,38 @@ def excitation(channels=2, repeats=3, level_db=-20.0, fs=FS):
     schedule = []
     pos = lead
     for ch, r in order:
-        out[pos:pos + len(s), ch] = s
+        out[pos:pos + len(s), ch] = sweeps[ch] * 10 ** (levels[ch] / 20)
         schedule.append((ch, r, pos))
         pos += len(s) + gap
     return out, schedule
 
 
-def probe(level_db=-35.0, fs=FS):
-    """A short, quiet mid-band sweep on both channels to set the level."""
-    s = sweep(seconds=1.0, f1=200, f2=4000, fs=fs) * 10 ** (level_db / 20)
+def probe(level_db=-35.0, fs=FS, f1=200.0, f2=4000.0, seconds=1.0, channels=2):
+    """A short, quiet sweep to set the level: mid-band on the mains by default,
+    or a bass band (f1, f2) on a single channel for the sub."""
+    s = sweep(seconds=seconds, f1=f1, f2=f2, fs=fs) * 10 ** (level_db / 20)
     lead = int(0.5 * fs)
-    out = np.zeros((lead + len(s) + lead, 2), dtype=np.float32)
+    out = np.zeros((lead + len(s) + lead, channels), dtype=np.float32)
     out[lead:lead + len(s)] = s[:, None]
     return out, lead
 
 
-def probe_level(recording, played, lead, fs=FS):
+def probe_level(recording, played, lead, fs=FS, band=None, seconds=1.0):
     """How loud the probe arrived, and how loud the room is without it.
 
+    band: optional (lo, hi) Hz; both are measured in that band only, so room
+    rumble outside it does not count (used for the sub's bass probe).
     Returns (signal peak dBFS, noise rms dBFS) at the microphone.
     """
     rec = np.asarray(recording, dtype=np.float64)
     if rec.ndim > 1:
         rec = rec.mean(axis=1)
     offset = locate(rec, played.mean(axis=1))
+    if band is not None:
+        sos = signal.butter(4, band, btype="bandpass", fs=fs, output="sos")
+        rec = signal.sosfiltfilt(sos, rec)
     noise = rec[offset + lead // 5:offset + lead - lead // 5]
-    seg = rec[offset + lead:offset + lead + int(1.0 * fs)]
+    seg = rec[offset + lead:offset + lead + int(seconds * fs)]
     if len(seg) == 0:
         raise MeasurementError("The microphone recording ended before the probe.")
     peak = 20 * np.log10(np.max(np.abs(seg)) + 1e-12)
@@ -297,6 +309,12 @@ def analyze(recording, played, schedule, fs=FS, cycles=15.0, max_gate=0.3):
         snr = mean - smooth(noise, 3)
         mid = (GRID >= 200) & (GRID <= 5000)
         if np.median(snr[mid]) < 15:
+            bass = (GRID >= 30) & (GRID <= 100)
+            if np.median(snr[bass]) >= 20:
+                # Strong bass, nothing above it: the sub played, the main speaker did not.
+                raise MeasurementError(
+                    "Only the bass was heard: the main speaker stayed silent. Check that the amplifier is "
+                    "on the input PiDSP is connected to, not muted and not in standby, and measure again.")
             raise MeasurementError(
                 "The room is too loud compared to the sweeps, or the volume is too low. "
                 "Make it quiet, turn the volume up a little, and measure again.")
@@ -401,7 +419,8 @@ def combine(measurements):
         spread = np.std(np.vstack([by_repeat, positions]), axis=0) if len(reps) + count > 2 else np.zeros_like(mean)
         snr = np.min(np.array([m["channels"][ch]["snr"] for m in measurements]), axis=0)
         arrival = float(np.mean([np.mean(m["channels"][ch]["arrivals"]) for m in measurements]))
-        out.append({"mean": mean, "repeats": by_repeat, "spread": spread, "snr": snr, "arrival": arrival})
+        out.append({"mean": mean, "repeats": by_repeat, "spread": spread, "snr": snr, "arrival": arrival,
+                    "positions": len(reps)})
         # Timing, from measurements made since it was kept: the group delay
         # weighted by how loud each sweep was there, and how far the
         # positions and repeats disagree on it.
@@ -490,18 +509,18 @@ def peq_db(filters, freqs=GRID):
     return total
 
 
-def find_knee(mean, target):
+def find_knee(mean, target, search_below=400.0):
     """Where the speaker gives up: the highest frequency below 400 Hz that falls
     more than 12 dB short of the target. 0 when it reaches the bottom of the band."""
     # Smoothed by a third of an octave, so a narrow cancellation notch is not
     # mistaken for the speaker running out.
-    short = (GRID < 400) & (smooth(mean, 3) - target < -12)
+    short = (GRID < search_below) & (smooth(mean, 3) - target < -12)
     if not short.any():
         return 0.0
     return float(np.clip(GRID[short].max(), 25.0, 200.0))
 
 
-def fit_floor(mean, target, knee):
+def fit_floor(mean, target, knee, search_below=400.0):
     """Lowest frequency the EQ works on: above the knee, and above where the
     response is still more than 6 dB short of the target.
 
@@ -509,7 +528,7 @@ def fit_floor(mean, target, knee):
     would only invite a broad cut everywhere else, which after level matching is
     a bass boost in disguise.
     """
-    short = (GRID < 400) & (smooth(mean, 3) - target < -6)
+    short = (GRID < search_below) & (smooth(mean, 3) - target < -6)
     floor = float(GRID[short].max()) * 1.1 if short.any() else F_LOW
     return max(F_LOW, knee * 1.2 if knee else F_LOW, floor)
 
@@ -686,37 +705,50 @@ def _prune(filters, channel, hp, goal, w, level):
     return kept
 
 
-def magnitude_correction(channel, target, fmax=18000.0):
+def magnitude_correction(channel, target, fmax=18000.0, bass_search_hz=400.0):
     """The smoothed tone correction in dB on GRID, and the knee.
 
     Same budget as the PEQ: dips are only half filled, boosts and cuts are
     clamped, and the correction fades to 0 dB outside the measured band.
+    bass_search_hz: where to look for the bottom of the system (knee and fit
+    floor). 400 Hz suits speakers without a sub; with a sub the system plays
+    to about 20 Hz, and only a shortfall below ~40 Hz is the sub running out.
+    Above that a shortfall is a room dip, not a reason to stop correcting.
     """
     mean = smooth(channel["mean"], 6)
-    knee = find_knee(mean, target)
+    knee = find_knee(mean, target, bass_search_hz)
     base = [{"type": "Highpass", "freq": knee, "q": 0.707}] if knee > 30 else []
     goal = target + peq_db(base)
-    fmin = fit_floor(mean, target, knee)
+    fmin = fit_floor(mean, target, knee, bass_search_hz)
     band = (GRID >= fmin) & (GRID <= fmax)
     level = np.mean((goal - mean)[band & (GRID >= 300) & (GRID <= 3000)]) if (band & (GRID >= 300)).any() else 0.0
     corr = goal - (mean + level) - peq_db(base)
+    deviation = corr.copy()
     corr = np.where(corr > 0, corr * 0.5, corr)
     corr = np.clip(corr, MAX_TOTAL_CUT, MAX_TOTAL_BOOST)
-    # Trust: fade out where the noise floor or the repeats say not to.
-    trust = (1 / (1 + np.exp(-(channel["snr"] - 12) / 3))) / (1 + (channel["spread"] / 2.0) ** 2)
-    corr *= trust
+    # Trust: fade out where the noise floor says not to, and where the
+    # deviation is small next to the uncertainty of the average. The average
+    # of n positions is sqrt(n) times surer than one position, so a peak that
+    # is large compared with spread / sqrt(n) is corrected almost fully even
+    # though the positions differ (they do: 3 to 5 dB at 30 to 50 cm apart is
+    # normal in the bass), and a small one that the positions disagree on is
+    # mostly left alone. (A Wiener-style shrinkage of the correction.)
+    n = max(int(channel.get("positions", 1)), 1)
+    uncertainty2 = smooth(channel["spread"], 6) ** 2 / n
+    agreement = deviation ** 2 / (deviation ** 2 + uncertainty2 + 1e-12)
+    corr *= agreement / (1 + np.exp(-(channel["snr"] - 12) / 3))
     fade_lo = np.clip(np.log2(GRID / fmin) * 2 + 1, 0, 1)
     fade_hi = np.clip(np.log2(fmax / GRID) * 2 + 1, 0, 1)
     corr *= fade_lo * fade_hi
     return knee, corr
 
 
-def fir_correction(channel, target, taps=8192, fs=FS, fmax=18000.0):
+def fir_correction(channel, target, taps=8192, fs=FS, fmax=18000.0, bass_search_hz=400.0):
     """Minimum-phase FIR that corrects the smoothed response to the target.
 
     Returns (taps array, knee, correction dB on GRID).
     """
-    knee, corr = magnitude_correction(channel, target, fmax)
+    knee, corr = magnitude_correction(channel, target, fmax, bass_search_hz)
     n = taps * 2
     freqs = np.fft.rfftfreq(n, 1 / fs)
     mag_db = np.interp(np.log(np.maximum(freqs, F_LOW)), np.log(GRID), corr)

@@ -35,6 +35,12 @@ from .audio import Capture, play_and_record
 PROBE_DB = -40.0
 GOAL_PEAK_DB = -35.0
 OUTPUT_CEILING_DB = -12.0
+# The sub is probed on its own, in its own band, before any sweep plays on it.
+SUB_PROBE_BAND = (25.0, 120.0)
+SUB_PROBE_SECONDS = 1.5
+# A probe this loud at the microphone (about 95 dB SPL) means the speaker's own
+# level is far too high; stop rather than sweep.
+TOO_LOUD_PROBE_DB = -20.0
 REPEATS = 2
 
 MEASURE_CONFIG = "measure.yml"
@@ -158,16 +164,34 @@ class Session:
         return rig.mic(play_and_record(signal, rig.player, rig.capture, cancel=self.cancel))
 
 
-def choose_sweep_level(session: Session, rig: Rig, channels: int) -> dict:
-    """Play a quiet probe on the mains and pick the sweep level from what the mic heard."""
-    probe, lead = cal.probe(PROBE_DB)
+def _probe(session: Session, rig: Rig, channels: int, cols: list[int], what: str, **kw) -> dict:
+    band = (kw["f1"], kw["f2"]) if "f1" in kw else None
+    probe, lead = cal.probe(PROBE_DB, channels=len(cols), **kw)
     played = np.zeros((len(probe), channels), dtype=np.float32)
-    played[:, :2] = probe
+    played[:, cols] = probe
     rec = session.sweep(rig, played)
-    peak, noise = cal.probe_level(rec, played[:, :2], lead)
+    peak, noise = cal.probe_level(rec, probe, lead, band=band, seconds=kw.get("seconds", 1.0))
+    if peak > TOO_LOUD_PROBE_DB:
+        raise cal.MeasurementError(
+            f"The {what} is very loud even at the quiet test level ({peak:.0f} dBFS at the microphone). "
+            f"Turn {'the sub level down in its app' if what == 'sub' else 'the Powernode volume down'} "
+            "and measure again.")
     level = cal.choose_level(PROBE_DB, peak, noise, goal_peak_db=GOAL_PEAK_DB, ceiling_db=OUTPUT_CEILING_DB)
-    return {"probe_db": PROBE_DB, "probe_peak_db": round(peak, 1), "noise_db": round(noise, 1),
-            "sweep_db": round(level, 1)}
+    return {"probe_peak_db": round(peak, 1), "noise_db": round(noise, 1), "sweep_db": round(level, 1)}
+
+
+def choose_sweep_level(session: Session, rig: Rig, channels: int) -> dict:
+    """Quiet probes, the mains first and then the sub on its own, and a sweep
+    level for each from what the microphone heard."""
+    mains = _probe(session, rig, channels, [0, 1], "main speakers")
+    out = {"probe_db": PROBE_DB, **mains}
+    if channels > 2:
+        session.check()
+        sub = _probe(session, rig, channels, [2], "sub", f1=SUB_PROBE_BAND[0], f2=SUB_PROBE_BAND[1],
+                     seconds=SUB_PROBE_SECONDS)
+        out["sub"] = sub
+        out["sub_sweep_db"] = sub["sweep_db"]
+    return out
 
 
 def measure_bass(session: Session, rig: Rig, mic_curve: np.ndarray | None = None) -> dict:
@@ -180,7 +204,9 @@ def measure_bass(session: Session, rig: Rig, mic_curve: np.ndarray | None = None
     level = choose_sweep_level(session, rig, 3)
     session.check()
     p("Measuring left, right and sub", 0.25)
-    played, schedule = cal.excitation(channels=3, repeats=REPEATS, level_db=level["sweep_db"])
+    levels = [level["sweep_db"], level["sweep_db"], level.get("sub_sweep_db", level["sweep_db"])]
+    played, schedule = cal.excitation(channels=3, repeats=REPEATS, level_db=levels,
+                                      bands=[None, None, bass.SUB_SWEEP_HZ])
     rec = session.sweep(rig, played)
     session.check()
     p("Working out the crossover and delays", 0.85)
@@ -219,43 +245,53 @@ def curves(responses: list[dict], plan: dict, points: int = 160) -> dict:
     def c(h):
         return np.round(cal.smooth(bass.db(h), 6)[idx] - ref, 2).tolist()
 
+    sub_idx = idx[cal.GRID[idx] <= bass.SUB_SWEEP_HZ[1]]  # the sub is only swept this far
+    sub = cal.smooth(bass.db(responses[bass.SUB]["h"]), 6)
     return {
         "freq": np.round(cal.GRID[idx], 1).tolist(),
         "left": c(responses[bass.LEFT]["h"]),
         "right": c(responses[bass.RIGHT]["h"]),
-        "sub": c(responses[bass.SUB]["h"]),
+        "sub_freq": np.round(cal.GRID[sub_idx], 1).tolist(),
+        "sub": np.round(sub[sub_idx] - ref, 2).tolist(),
         "sum_left": c(bass.predicted_sum(responses, plan, "left")),
         "sum_right": c(bass.predicted_sum(responses, plan, "right")),
     }
 
 
 def measure_side(session: Session, rig: Rig, plan: dict, side: str, level_db: float,
-                 mic_curve: np.ndarray | None = None, fir: dict | None = None) -> dict:
-    """Stage B: one main speaker plus the sub, through the planned crossover and delays.
+                 mic_curve: np.ndarray | None = None, fir: dict | None = None, preamp_db: float = 0.0) -> dict:
+    """Stage B: one main speaker plus the sub, through the planned crossover and
+    delays (and, for stage C, the room correction FIRs and their preamp).
 
     Returns calibration.analyze()'s result for that side (one channel).
     """
-    session.load(rig.decorate(cfgmod.build(plan, fir=fir, hardware=rig.hardware, measure_side=side)))
+    session.load(rig.decorate(cfgmod.build(plan, fir=fir, preamp_db=preamp_db, hardware=rig.hardware,
+                                           measure_side=side)))
     session.check()
     one, schedule = cal.excitation(channels=1, repeats=REPEATS, level_db=level_db)
     played = np.zeros((len(one), 2), dtype=np.float32)
     played[:, 0 if side == "left" else 1] = one[:, 0]
     rec = session.sweep(rig, played)
     session.check()
-    result = cal.analyze(rec, one, schedule)
+    try:
+        result = cal.analyze(rec, one, schedule)
+    except cal.MeasurementError as e:
+        raise cal.MeasurementError(f"{side.capitalize()} speaker and sub: {e}") from e
     if mic_curve is not None:
         cal.apply_mic_calibration(result, mic_curve)
     return result
 
 
 def measure_position(session: Session, rig: Rig, plan: dict, level_db: float,
-                     mic_curve: np.ndarray | None = None) -> dict:
-    """Stage B, one microphone position: left+sub, then right+sub."""
+                     mic_curve: np.ndarray | None = None, fir: dict | None = None,
+                     preamp_db: float = 0.0) -> dict:
+    """Stage B, one microphone position: left+sub, then right+sub. With fir
+    (and its preamp), stage C: the same through the room correction."""
     p = session.progress
     out = {"channels": [], "warnings": []}
     for i, side in enumerate(("left", "right")):
         p(f"Measuring {side} speaker and sub", 0.1 + 0.42 * i)
-        r = measure_side(session, rig, plan, side, level_db, mic_curve)
+        r = measure_side(session, rig, plan, side, level_db, mic_curve, fir=fir, preamp_db=preamp_db)
         out["channels"].append(r["channels"][0])
         out["warnings"] += [w.replace("Channel 1", side.capitalize()) for w in r["warnings"]]
         out[f"{side}_peak_dbfs"] = r["peak_dbfs"]

@@ -7,7 +7,7 @@ The running pipeline:
     -> mixer: L -> left outputs, R -> right outputs, (L + R) / 2 -> sub outputs
     -> left/right: LR4 high-pass, delay, trim
     -> sub: LR4 low-pass, delay, trim/polarity, volume (fader Aux1)
-  playback (USB card, e.g. 8 ch on a CM6206)
+  playback (USB card, 6 of the CM6206's 8 channels)
 
 The sub's Volume filter listens to fader Aux1. PiDSP sets Aux1 from the
 Bluesound's volume, so the sub follows the volume set after CamillaDSP on the
@@ -29,15 +29,24 @@ import copy
 import yaml
 
 # Hardware defaults for the reference setup. The CM6206 enumerates as
-# "ICUSBAUDIO7D" (USB 0d8c:0102): 8-ch S16_LE playback, 2-ch capture with the
-# S/PDIF input selected by the "PCM Capture Source" mixer control. Still to
-# confirm: which half of the 3.5 mm centre/sub jack carries the sub, so the sub
-# is sent to both centre and LFE (USB order FL FR FC LFE ...).
+# "ICUSBAUDIO7D" (USB 0d8c:0102): S16_LE playback with 2, 4, 6 or 8 channels
+# (USB order FL FR FC LFE ...), 2-ch capture with the S/PDIF input selected by
+# the "PCM Capture Source" mixer control.
+# PiDSP opens it with 6 channels (measured on the reference unit):
+# - 8 channels leave no USB bandwidth for the microphone: the CM6206 and the
+#   UMIK-1 are full-speed (12 Mbit/s) devices sharing a single-TT hub ("Not
+#   enough bandwidth for altsetting 1"). 6 channels + microphone fit, and so
+#   do 6 channels + the S/PDIF input; all three together do not, but a
+#   measurement captures from the loopback, which releases the S/PDIF input
+#   before the microphone opens.
+# - 4 channels fit everything, but in that mode channels 3-4 do not reach the
+#   centre/sub jack (they most likely go to the rear jack).
+# The sub goes to both halves of the centre/sub jack (channels 3 and 4).
 DEFAULT_HARDWARE = {
     "samplerate": 48000,
     "chunksize": 2048,
     "capture": {"type": "Alsa", "device": "hw:CARD=ICUSBAUDIO7D,DEV=0", "channels": 2, "format": "S16_LE"},
-    "playback": {"type": "Alsa", "device": "hw:CARD=ICUSBAUDIO7D,DEV=0", "channels": 8, "format": "S16_LE"},
+    "playback": {"type": "Alsa", "device": "hw:CARD=ICUSBAUDIO7D,DEV=0", "channels": 6, "format": "S16_LE"},
     "outputs": {"left": [0], "right": [1], "sub": [2, 3]},
     # The TV's S/PDIF clock and the DAC's clock are independent: let CamillaDSP
     # track the drift with an async resampler.
@@ -146,7 +155,9 @@ def build(plan, fir=None, preamp_db=0.0, hardware=None, measure_side=None, title
         if spec.get("trim_db") or spec.get("inverted"):
             names.append(add(f"trim_{role}", "Gain", gain=spec.get("trim_db", 0.0),
                              inverted=bool(spec.get("inverted"))))
-        if role == "sub":
+        if role == "sub" and not measure_side:
+            # Listening only: a measurement must see the calibrated level,
+            # whatever the listener's sub level or the amplifier's volume.
             names.append(add("sub_volume", "Volume", ramp_time=SUB_VOLUME_RAMP_MS, fader=SUB_FADER))
         pipeline.append({"type": "Filter", "channels": list(hw["outputs"][role]), "names": names})
 

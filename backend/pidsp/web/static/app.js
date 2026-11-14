@@ -46,10 +46,11 @@ function engine(s) {
   if (!c.reachable) return { kind: "bad", text: "CamillaDSP not reachable" };
   const rate = c.capture_rate ? ` · ${(c.capture_rate / 1000).toFixed(c.capture_rate % 1000 ? 1 : 0)} kHz` : "";
   if (s.measuring) return { kind: "warn", text: "Measuring…", input: "In use for measuring" };
+  if (s.guard?.silenced) return { kind: "bad", text: `Silenced: the TV sends ${s.guard.format}`, input: `${s.guard.format}, not PCM` };
   if (c.config_path?.endsWith("/measure.yml") && c.state !== "Inactive")
     return { kind: "warn", text: "CamillaDSP running a measurement setup", input: "In use for measuring" };
   switch (c.state) {
-    case "Running": return { kind: "ok", text: `CamillaDSP running${rate} · optical locked`, input: "Locked" };
+    case "Running": return { kind: "ok", text: `CamillaDSP running${rate} · optical locked${c.config_path?.endsWith("/compare.yml") ? " · room correction off" : ""}`, input: "Locked" };
     case "Stalled": return { kind: "warn", text: "CamillaDSP waiting for an optical signal", input: "No signal" };
     case "Paused": return { kind: "warn", text: "CamillaDSP paused (no signal)", input: "No signal" };
     case "Starting": return { kind: "warn", text: "CamillaDSP starting…", input: "—" };
@@ -171,18 +172,27 @@ const dashboard = {
       <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4"/></svg>
       Start calibration</a>
   </div>
+  <div id="d-guard"></div>
   <div class="grid">
     <section class="card" aria-labelledby="h-sig"><h2 id="h-sig">Signal path</h2>
       <div class="rows" id="d-sig"></div>
       <p class="note">Latency is fixed once filters are built, so the Apple TV's Wireless Audio Sync keeps holding.</p>
     </section>
-    <section class="card" aria-labelledby="h-vol"><div class="card-head"><h2 id="h-vol">Volume</h2><span class="tag">Coming soon</span></div>
-      <div style="display:flex;align-items:baseline;gap:10px"><span class="big">—</span><span class="muted">dB on the Powernode</span></div>
-      <div class="meter" aria-hidden="true"><div style="width:0;background:var(--after)"></div></div>
-      <div class="switch-row"><div><div style="font-weight:500">Sub follows volume</div><div class="muted small">Read from BluOS, applied to the sub's fader</div></div>
-        <button type="button" class="switch" aria-pressed="false" aria-label="Sub follows volume" disabled></button></div>
-      <div class="switch-row"><div><div style="font-weight:500">Loudness</div><div class="muted small">Fuller bass and treble at low volume</div></div>
-        <button type="button" class="switch" aria-pressed="false" aria-label="Loudness" disabled></button></div>
+    <section class="card" aria-labelledby="h-vol"><div class="card-head"><h2 id="h-vol">Volume</h2><span class="tag" id="v-tag">—</span></div>
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"><span class="big" id="v-big">—</span><span class="muted" id="v-db">Powernode volume</span></div>
+      <div class="rows" id="v-rows"></div>
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:baseline"><label for="v-sub" style="font-weight:500">Sub level</label><span class="mono" id="v-subval">—</span></div>
+        <input type="range" id="v-sub" min="-10" max="10" step="0.5" value="0" aria-describedby="v-subnote" style="width:100%">
+        <div class="muted small" id="v-subnote">On top of the calibrated level.</div>
+      </div>
+      <div class="switch-row"><div><div style="font-weight:500">Sub follows the Powernode</div><div class="muted small" id="v-follownote">Read from BluOS, applied to the sub only</div></div>
+        <button type="button" class="switch" id="v-follow" aria-pressed="false" aria-label="Sub follows the Powernode's volume"></button></div>
+      <form id="v-hostform" class="stack" hidden>
+        <label class="field">Powernode address<input type="text" name="host" placeholder="e.g. 192.168.1.50" autocomplete="off" inputmode="url"></label>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><button class="btn" type="submit">Connect</button><span class="msg" id="v-hostmsg" role="status"></span></div>
+      </form>
+      <span class="msg" id="v-msg" role="status"></span>
     </section>
     <section class="card" aria-labelledby="h-cal"><h2 id="h-cal">Calibration</h2><div id="d-cal" style="display:contents"></div></section>
   </div>
@@ -196,8 +206,59 @@ const dashboard = {
   </div>
   <section class="card" aria-labelledby="h-bm" id="d-bm"></section>
   <footer class="foot" id="d-foot"></footer>`,
+  mount() {
+    $("#d-cal").addEventListener("click", async (ev) => {
+      const b = ev.target.closest("[data-ab]");
+      if (!b || b.getAttribute("aria-pressed") === "true") return;
+      b.parentElement.querySelectorAll("button").forEach((x) => (x.disabled = true));
+      try { await api("/api/compare", { method: "POST", body: JSON.stringify({ room_correction: b.dataset.ab === "true" }) }); }
+      catch (e) { alert(e.message); }
+      await poll();
+    });
+    const slider = $("#v-sub"), msg = $("#v-msg");
+    const send = async (body) => {
+      try {
+        const v = await api("/api/volume", { method: "PUT", body: JSON.stringify(body) });
+        if (status) { status.volume = v; renderVolume(status); }
+        msg.textContent = "";
+      } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+    };
+    slider.addEventListener("input", () => { $("#v-subval").textContent = fmtDb(Number(slider.value)); });
+    slider.addEventListener("change", () => send({ sub_level_db: Number(slider.value) }));
+    $("#v-follow").addEventListener("click", (ev) => send({ follow_volume: ev.currentTarget.getAttribute("aria-pressed") !== "true" }));
+    $("#v-hostform").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const m = $("#v-hostmsg");
+      m.className = "msg"; m.textContent = "Connecting…";
+      try {
+        const v = await api("/api/volume", { method: "PUT", body: JSON.stringify({ bluos_host: ev.target.host.value }) });
+        m.textContent = ""; volumeUi.editHost = false;
+        if (status) { status.volume = v; renderVolume(status); }
+      } catch (e) { m.className = "msg bad"; m.textContent = e.message; }
+    });
+    $("#v-rows").addEventListener("click", async (ev) => {
+      const a = ev.target.closest("[data-vact]");
+      if (!a) return;
+      ev.preventDefault();
+      if (a.dataset.vact === "host") { volumeUi.editHost = true; renderVolume(status); $("#v-hostform").host.focus(); }
+      if (a.dataset.vact === "ref") {
+        const ok = await confirmDialog({ title: "Use the current volume as the reference?",
+          text: "The sub then plays at its calibrated level when the Powernode is at its current volume. Use this if the volume was different when you measured.", ok: "Use current volume" });
+        if (!ok) return;
+        try {
+          const v = await api("/api/volume/reference", { method: "POST" });
+          if (status) { status.volume = v; renderVolume(status); }
+        } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+      }
+    });
+  },
   update(s) {
     const c = s.camilladsp || {}, d = s.devices || {}, e = engine(s);
+    renderVolume(s);
+    set("d-guard", s.guard?.silenced ? `<section class="card" role="alert" style="border-color:#5A2E2E">
+      <div style="display:flex;gap:12px;align-items:flex-start">${dot("bad")}<div>
+        <div style="font-weight:600">Sound stopped: the TV sends ${esc(s.guard.format)}, not plain stereo (PCM)</div>
+        <div class="muted small">Played as PCM, that data would come out of the speakers as loud noise. On the TV, set the digital audio output (optical / S/PDIF) to <b>PCM</b>. PiDSP starts the sound again by itself as soon as it receives PCM.</div></div></div></section>` : "");
     set("d-sig", [
       ["Input", `Optical from TV · ${e.input || "—"}`],
       ["Output", d.dac?.present ? "CM6206 · L, R, Sub" : `<span style="color:var(--bad)">CM6206 not found</span>`],
@@ -209,7 +270,9 @@ const dashboard = {
     set("d-cal", cal ? `
       <div><div style="font-size:18px;font-weight:600">${cal.room ? `Room correction · ${TARGET_NAMES[cal.room.target]} target` : `Bass setup · ${cal.plan.crossover_hz} Hz crossover`}</div>
         <div class="muted small">Applied ${esc(fmtDate(cal.applied))}${cal.room ? ` · ${cal.room.positions} mic position${cal.room.positions === 1 ? "" : "s"}` : ". Room correction comes next."}</div></div>
-      ${cal.room ? `<div class="row small"><span>Predicted deviation</span><span class="mono">±${cal.room.sides.left.deviation_after_db.toFixed(1)} dB (was ±${cal.room.sides.left.deviation_before_db.toFixed(1)})</span></div>` : ""}
+      ${cal.room ? `<div class="row small"><span>Predicted deviation</span><span class="mono">±${cal.room.sides.left.deviation_after_db.toFixed(1)} dB (was ±${cal.room.sides.left.deviation_before_db.toFixed(1)})</span></div>
+      <div><div class="muted small" style="margin-bottom:6px">Room correction, to compare by ear (same level both ways)</div>
+        <div class="seg" role="group" aria-label="Room correction">${[[true, "On"], [false, "Off"]].map(([on, t]) => `<button type="button" data-ab="${on}" aria-pressed="${on !== !!c.config_path?.endsWith("/compare.yml")}" ${s.measuring ? "disabled" : ""}>${t}</button>`).join("")}</div></div>` : ""}
       <div class="row small"><span>Summation at crossover</span><span class="mono">${fmtDb(cal.plan.summation_db)}</span></div>
       <a class="small" href="#/filters" style="font-weight:500">Open filters →</a>` : `
       <div class="empty"><div class="title">Not calibrated yet</div>
@@ -230,6 +293,41 @@ const dashboard = {
     }
   },
 };
+
+const volumeUi = { editHost: false };
+
+function renderVolume(s) {
+  const v = s?.volume;
+  if (!v || !$("#v-big")) return;
+  const p = v.player, g = v.sub || {}, host = v.bluos_host;
+  const tag = $("#v-tag");
+  tag.textContent = !host ? "Not set up" : v.error ? "Not reachable" : g.following ? "Following" : "Not following";
+  tag.style.cssText = g.following && !v.error ? "background:#16301F;color:var(--ok)" : v.error ? "background:#2A1717;color:var(--bad)" : "";
+  set("v-big", p ? (p.mute ? "Muted" : esc(p.volume)) : "—");
+  set("v-db", p ? `${p.db != null ? minus(p.db.toFixed(1)) + " dB · " : ""}Powernode volume` : host ? "Powernode volume" : "Connect the Powernode to follow its volume");
+  const rows = [];
+  if (host) {
+    rows.push(["Powernode", `<span class="mono">${esc(host)}</span> · <a href="#" data-vact="host">change</a>`]);
+    if (v.error) rows.push(["Status", `<span style="color:var(--bad)">${esc(v.error)}</span>`]);
+    if (p) rows.push(["Input", p.analog ? esc(p.input) : `<span style="color:var(--warn)">${esc(p.input || "another source")} · TV sound from PiDSP is not playing</span>`]);
+    const ref = v.reference || {};
+    rows.push(["Calibrated at", ref.db != null ? `volume ${esc(ref.volume ?? "?")} (${minus(ref.db.toFixed(1))} dB) · <a href="#" data-vact="ref">use current</a>`
+      : `not recorded · <a href="#" data-vact="ref">use current volume</a>`]);
+  }
+  rows.push(["Sub now", g.mute ? `<span style="color:var(--warn)">muted: ${esc(g.mute_reason)}</span>`
+    : `<span class="mono">${fmtDb(g.fader_db ?? 0)}</span>${g.following ? ` <span class="muted small">(level ${fmtDb(g.sub_level_db ?? 0)}, volume ${fmtDb(g.offset_db ?? 0)})</span>` : ""}${g.clamped ? ` <span style="color:var(--warn)" class="small">at its maximum</span>` : ""}`]);
+  set("v-rows", rows.map(([k, val]) => `<div class="row"><span>${k}</span><span>${val}</span></div>`).join(""));
+  const slider = $("#v-sub");
+  if (document.activeElement !== slider) {
+    slider.value = v.sub_level_db ?? 0;
+    $("#v-subval").textContent = fmtDb(Number(slider.value));
+  }
+  const sw = $("#v-follow");
+  sw.setAttribute("aria-pressed", String(!!v.follow_volume));
+  sw.disabled = !host;
+  set("v-follownote", host ? "The sub moves with the Powernode's volume, and mutes when it is muted or on another input." : "Connect the Powernode below first.");
+  $("#v-hostform").hidden = !!host && !volumeUi.editHost;
+}
 
 function footer(id, s) {
   const sys = s.system || {};
@@ -279,6 +377,7 @@ const calibrate = {
   <section class="card" id="c-job" aria-live="polite" hidden></section>
   <section class="card" id="c-result" aria-labelledby="h-res" hidden></section>
   <section class="card" id="c-room" aria-labelledby="h-room2" hidden></section>
+  <section class="card" id="c-check" aria-labelledby="h-chk" hidden></section>
   <div class="grid wide">
     <section class="card" aria-labelledby="h-chk"><h2 id="h-chk">Before you start</h2>
       <ul class="checks" id="c-checks"></ul>
@@ -315,11 +414,13 @@ const calibrate = {
     $("#c-micfile").addEventListener("change", uploadMic);
     $("#c-micdel").addEventListener("click", deleteMic);
     try {
-      const [mic, bass, job, room] = await Promise.all([api("/api/mic"), api("/api/bass"), api("/api/measure/job"), api("/api/room")]);
-      calState.mic = mic.calibration; calState.bass = bass.result; calState.job = job; calState.room = room;
+      const [mic, bass, job] = await Promise.all([api("/api/mic"), api("/api/bass"), api("/api/measure/job")]);
+      calState.mic = mic.calibration; calState.bass = bass.result; calState.bassOther = bass.other; calState.job = job;
+      await loadRoomAndCheck();
+      const room = calState.room;
       if (room.build) calState.target = room.build.target;
     } catch (_) { /* shown by the status pill */ }
-    renderMic(); renderResult(); renderRoom(); renderJob();
+    renderMic(); renderResult(); renderRoom(); renderCheck(); renderJob();
     if (status) calibrate.update(status);
     if (calState.job?.state === "running") pollJob();
   },
@@ -334,6 +435,7 @@ const calibrate = {
       [c.reachable ? "ok" : "bad", "DSP engine", c.reachable ? `CamillaDSP ${esc(c.version)} ready` : "CamillaDSP is not running."],
       [d.loopback?.present ? "ok" : "bad", "Measurement path", d.loopback?.present ? "ALSA loopback ready" : "ALSA loopback missing. Rerun the install script."],
       ["", "Speaker level", "Set the Powernode to your usual listening volume, then leave it there."],
+      ["", "Subwoofer settings", "Turn the sub's own low-pass filter off, or to its highest setting (LFE), in its app. PiDSP sets the crossover; two would stack."],
       [e.input === "Locked" ? "ok" : "", "Optical input", e.input === "Locked" ? "Signal locked" : "Not needed for measuring"],
     ];
     set("c-checks", items.map(([k, what, how]) => `<li>${dot(k)}<div><div class="what">${what}</div><div class="muted small">${how}</div></div></li>`).join(""));
@@ -345,7 +447,7 @@ const calibrate = {
     $("#c-start").textContent = calState.bass && !calState.bass.selftest ? "Measure bass again" : "Start bass setup";
     set("c-hint", busy ? "A measurement is running." : !c.reachable ? "Waiting for CamillaDSP." : !d.dac?.present ? "Connect the sound card to start." : !mic.card ? "Connect the microphone to start." : "");
     const room = calState.room;
-    const step = room?.build ? 3 : calState.bass ? 2 : busy ? 1 : 0;
+    const step = calState.check && room?.build && calState.check.built === room.build.built ? 4 : room?.build ? 3 : calState.bass ? 2 : busy ? 1 : 0;
     set("c-steps", STEPS.map((t, i) => `<li${i === step ? ' aria-current="step"' : ""}>${t}</li>`).join(""));
   },
 };
@@ -356,9 +458,11 @@ async function startBass() {
     text: `<p>Sweeps will play through the left, right and sub speakers, about 40 seconds in all.</p>
       <ul style="padding-left:18px">
         <li>Set the Powernode to your normal listening volume, not louder.</li>
+        <li>Turn the sub's own low-pass filter off (or to LFE) in its app.</li>
         <li>Put the microphone at your main seat, at ear height, pointing at the ceiling.</li>
         <li>Keep the room quiet and stay still.</li></ul>
-      <p>The first sound is quiet. PiDSP sets the sweep level from what the microphone hears, up to a safe maximum.</p>
+      <p>First come two short, quiet test sounds: one on the main speakers, then one on the sub alone. PiDSP sets each speaker's sweep level from what the microphone hears, up to a safe maximum, and stops if a speaker is already loud at the quiet level.</p>
+      <p>If anything sounds too loud, press Cancel.</p>
       ${calState.mic ? "" : "<p style='color:var(--warn)'>No microphone calibration file yet. The bass setup still works.</p>"}`,
     ok: "Start",
   });
@@ -376,6 +480,22 @@ async function runBass(selftest) {
   }
 }
 
+// Room positions, build and check of whichever bass result is shown (real or self-test).
+async function loadRoomAndCheck() {
+  const sel = !!calState.bass?.selftest;
+  const [room, check] = await Promise.all([api(`/api/room?selftest=${sel}`), api(`/api/check?selftest=${sel}`)]);
+  calState.room = room; calState.check = check.result;
+}
+
+async function showBass(selftest) {
+  const b = await api(`/api/bass?selftest=${selftest}`);
+  calState.bass = b.result; calState.bassOther = b.other;
+  await loadRoomAndCheck();
+  if (calState.room?.build) calState.target = calState.room.build.target;
+  renderResult(); renderRoom(); renderCheck();
+  if (status) calibrate.update(status);
+}
+
 async function pollJob() {
   clearTimeout(calState.timer);
   try {
@@ -387,11 +507,15 @@ async function pollJob() {
     return;
   }
   if (calState.job?.state === "done") {
-    const roomJob = calState.job.kind.startsWith("room");
-    if (!roomJob) calState.bass = (await api("/api/bass")).result;
-    calState.room = await api("/api/room");
-    renderResult(); renderRoom();
-    $(roomJob ? "#c-room" : "#c-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const kind = calState.job.kind, roomJob = kind.startsWith("room"), checkJob = kind.startsWith("check");
+    const sel = kind.endsWith("selftest");
+    if (!roomJob && !checkJob) {
+      const b = await api(`/api/bass?selftest=${sel}`);
+      calState.bass = b.result; calState.bassOther = b.other;
+    }
+    await loadRoomAndCheck();
+    renderResult(); renderRoom(); renderCheck();
+    $(checkJob ? "#c-check" : roomJob ? "#c-room" : "#c-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
   if (status) calibrate.update(status);
 }
@@ -416,6 +540,35 @@ function renderJob() {
   }
 }
 
+function crossoverTable(plan, canChoose) {
+  const opts = plan.crossover_options;
+  if (!opts) return "";
+  const num = (v) => (v == null ? "" : minus(Number(v).toFixed(2)));
+  const manual = plan.crossover_choice === "listener";
+  const rows = opts.map((o) => o.excluded
+    ? `<tr class="off"><td class="mono">${o.crossover_hz} Hz</td><td colspan="5">${esc(o.excluded)}</td></tr>`
+    : `<tr class="${o.chosen ? "chosen" : ""}${canChoose && !o.chosen ? " pick" : ""}"${canChoose && !o.chosen ? ` data-xo="${o.crossover_hz}" tabindex="0" role="button" aria-label="Use ${o.crossover_hz} Hz"` : ""}>
+        <td class="mono">${o.crossover_hz} Hz${o.chosen ? " ✓" : ""}</td>
+        <td class="mono"><b>${num(o.score)}</b></td><td class="mono">${num(o.bumpiness_db)}</td>
+        <td class="mono">${num(o.summation_db)}</td><td class="mono">${num(o.strain_db)}</td><td class="mono">${num(o.localisation_db)}</td></tr>`).join("");
+  return `<details class="xo" id="c-xo"${calState.xoOpen ? " open" : ""}>
+    <summary>Why ${plan.crossover_hz} Hz? ${manual ? "Chosen by you" : "Every crossover compared"}${canChoose ? " · choose another" : ""}</summary>
+    <div class="xo-wrap"><table>
+      <thead><tr><th>Crossover</th><th>Score</th><th>Bumpiness</th><th>Summation</th><th>Mains strain</th><th>Localisation</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <p class="muted small" style="margin:8px 0 0">Lower score is better, in dB. Score = bumpiness of the predicted bass at your seat (25 to 250 Hz, both sides) + 2 × any summation loss at the crossover (room correction can't fill a cancellation) + mains strain (crossover below an octave above the main speakers' roll-off) + localisation (crossover above 80 Hz, where you start to hear where the sub stands). Close scores count as equal; then the crossover nearest an octave above the mains' roll-off wins.</p>
+    ${canChoose ? `<p class="muted small" style="margin:6px 0 0">Click a row to use that crossover instead. It is worked out again from this measurement, with no new sweeps.${manual ? ` <a href="#" id="c-xo-auto">Back to the automatic choice</a>` : ""}</p>` : ""}
+  </details>`;
+}
+
+async function chooseCrossover(fc) {
+  try {
+    const r = await api("/api/bass/crossover", { method: "POST", body: JSON.stringify({ crossover_hz: fc, selftest: !!calState.bass?.selftest }) });
+    calState.bass = r.result;
+    renderResult();
+  } catch (e) { alert(e.message); }
+}
+
 function renderResult() {
   const el = $("#c-result");
   if (!el) return;
@@ -428,7 +581,8 @@ function renderResult() {
     <p class="note">${r.verdict.passed ? "Passed. The measurement chain on this Pi works end to end." : "Failed. Something in the measurement chain is off; the details above show what."}</p>` : "";
   el.innerHTML = `
     <div class="card-head"><h2 id="h-res">${r.selftest ? "Self-test result" : "Bass setup result"}</h2>
-      <span class="tag${r.selftest ? "" : " example"}" style="${r.selftest ? "" : "background:#16273A;color:var(--after)"}">${r.selftest ? "Simulated speakers" : "Measured " + esc(fmtDate(r.measured))}</span></div>
+      <span style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">${calState.bassOther ? `<a href="#" class="small" id="c-other">${r.selftest ? "Show your room's result" : "Show the self-test result"}</a>` : ""}
+      <span class="tag${r.selftest ? "" : " example"}" style="${r.selftest ? "" : "background:#16273A;color:var(--after)"}">${r.selftest ? "Simulated speakers" : "Measured " + esc(fmtDate(r.measured))}</span></span></div>
     ${verdict}
     <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center">
       <div class="seg" role="group" aria-label="Side" style="min-width:260px">
@@ -438,16 +592,25 @@ function renderResult() {
     </div>
     ${chart({ fMax: 2000, yMin: -30, yMax: 15, height: 340, width: 1100, label: `Measured ${side} and sub responses and their predicted sum`, series: [
       { f: c.freq, db: c[side], color: C_MAIN, width: 1.6 },
-      { f: c.freq, db: c.sub, color: C_SUB, width: 1.6 },
+      { f: c.sub_freq || c.freq, db: c.sub, color: C_SUB, width: 1.6 },
       { f: c.freq, db: c["sum_" + side], color: C_SUM, width: 2.2 },
     ] })}
     ${bassTiles(plan)}
+    ${crossoverTable(plan, !(calState.job?.state === "running"))}
     ${(plan.warnings || []).map((w) => `<p class="note" style="color:var(--warn)">${esc(w)}</p>`).join("")}
-    <div class="muted small">Sweep level ${minus(r.level.sweep_db)} dBFS${r.selftest ? " · digital loopback, no noise" : ` · room noise ${minus(r.level.noise_db)} dBFS at the microphone · ${r.mic_calibrated ? "microphone calibration applied" : "no microphone calibration"}`}</div>
+    <div class="muted small">Sweep level ${minus(r.level.sweep_db)} dBFS${r.level.sub_sweep_db != null ? `, sub ${minus(r.level.sub_sweep_db)} dBFS` : ""}${r.selftest ? " · digital loopback, no noise" : ` · room noise ${minus(r.level.noise_db)} dBFS at the microphone · ${r.mic_calibrated ? "microphone calibration applied" : "no microphone calibration"}`}</div>
     ${r.selftest ? "" : `<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
       <button class="btn primary" type="button" id="c-apply" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Apply bass setup"}</button>
       <span class="muted small">${applied ? "This is the active setup." : "Sound from the TV then goes through this crossover and these delays."}</span></div>`}`;
   el.querySelectorAll("[data-side]").forEach((b) => b.addEventListener("click", () => { calState.side = b.dataset.side; renderResult(); }));
+  $("#c-xo")?.addEventListener("toggle", (e) => { calState.xoOpen = e.target.open; });
+  $("#c-other")?.addEventListener("click", (e) => { e.preventDefault(); showBass(!r.selftest); });
+  el.querySelectorAll("[data-xo]").forEach((row) => {
+    const go = () => chooseCrossover(Number(row.dataset.xo));
+    row.addEventListener("click", go);
+    row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+  });
+  $("#c-xo-auto")?.addEventListener("click", (e) => { e.preventDefault(); chooseCrossover(null); });
   $("#c-apply")?.addEventListener("click", applyBass);
 }
 
@@ -483,6 +646,7 @@ function renderRoom() {
       <div class="tiles">
         <div class="tile"><div class="k">Deviation before</div><div class="v">±${sd.deviation_before_db.toFixed(1)} dB</div><div class="k">40 Hz – 16 kHz, 90 % of the band</div></div>
         <div class="tile"><div class="k">Predicted after</div><div class="v" style="color:var(--ok)">±${sd.deviation_after_db.toFixed(1)} dB</div><div class="k">dips are only half filled, on purpose</div></div>
+        ${b.bass_lift_db != null ? `<div class="tile"><div class="k">Sub level</div><div class="v">${fmtDb(b.bass_lift_db)}</div><div class="k">brings the sub's range to the target</div></div>` : ""}
         <div class="tile"><div class="k">Headroom</div><div class="v">${fmtDb(b.preamp_db)}</div><div class="k">preamp, so boosts can't clip</div></div>
         <div class="tile"><div class="k">Built from</div><div class="v">${b.positions}</div><div class="k">mic position${b.positions === 1 ? "" : "s"} · ${TARGET_NAMES[b.target]} target</div></div>
       </div>
@@ -507,8 +671,8 @@ function renderRoom() {
   $("#c-rmeasure")?.addEventListener("click", () => measureRoom(next, selftest));
   $("#c-rclear")?.addEventListener("click", async () => {
     if (!(await confirmDialog({ title: "Start over?", text: "Removes the room correction measurements. What is applied stays.", ok: "Start over", danger: true }))) return;
-    await api("/api/room", { method: "DELETE" });
-    calState.room = await api("/api/room"); renderRoom();
+    await api(`/api/room?selftest=${!!calState.bass?.selftest}`, { method: "DELETE" });
+    await loadRoomAndCheck(); renderRoom(); renderCheck();
   });
   el.querySelectorAll("[data-target]").forEach((x) => x.addEventListener("click", () => { calState.target = x.dataset.target; renderRoom(); }));
   el.querySelectorAll("[data-rside]").forEach((x) => x.addEventListener("click", () => { calState.roomSide = x.dataset.rside; renderRoom(); }));
@@ -538,11 +702,71 @@ async function buildRoom() {
   const msg = $("#c-rmsg");
   msg.className = "msg"; msg.textContent = "Building…";
   try {
-    const r = await api("/api/room/build", { method: "POST", body: JSON.stringify({ target: calState.target }) });
+    const r = await api("/api/room/build", { method: "POST", body: JSON.stringify({ target: calState.target, selftest: !!calState.bass?.selftest }) });
     calState.room.build = r.build;
     renderRoom();
     if (status) calibrate.update(status);
   } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+}
+
+function renderCheck() {
+  const el = $("#c-check");
+  if (!el) return;
+  const r = calState.bass, room = calState.room, b = room?.build;
+  const selftest = !!r?.selftest;
+  const applied = status?.calibration?.kind === "room";
+  if (!r || !b || b.selftest !== selftest || (!selftest && !applied)) { el.hidden = true; return; }
+  el.hidden = false;
+  const c = calState.check && calState.check.built === b.built && !!calState.check.selftest === selftest ? calState.check : null;
+  const busy = calState.job?.state === "running";
+  const side = calState.checkSide || "left";
+  let res = "";
+  if (c) {
+    const cv = c.curves, sd = c.sides[side];
+    const series = [{ f: cv.freq, db: cv.target, color: "#8C939E", dash: true, width: 1.4 }];
+    if (cv[side + "_before"]) series.push({ f: cv.freq, db: cv[side + "_before"], color: "#F2A93B", width: 1.6 });
+    series.push({ f: cv.freq, db: cv[side + "_after"], color: "#5AA9FF", width: 2.2 });
+    res = `
+      <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center">
+        <div class="seg" role="group" aria-label="Side" style="min-width:260px">
+          <button type="button" data-cside="left" aria-pressed="${side === "left"}">Left + sub</button>
+          <button type="button" data-cside="right" aria-pressed="${side === "right"}">Right + sub</button></div>
+        <div class="legend">${cv[side + "_before"] ? `<span><i style="background:#F2A93B"></i>Before (position 1)</span>` : ""}<span><i style="background:#5AA9FF"></i>Measured now, corrected</span><span><i class="dash"></i>Target</span></div></div>
+      ${chart({ yMin: -15, yMax: 15, height: 300, width: 1100, label: `Check at the main seat, ${side}: before, after and target`, series })}
+      <div class="tiles">
+        ${sd.deviation_before_db != null ? `<div class="tile"><div class="k">Before, at this seat</div><div class="v">±${sd.deviation_before_db.toFixed(1)} dB</div><div class="k">position 1, without correction</div></div>` : ""}
+        <div class="tile"><div class="k">Now, corrected</div><div class="v" style="color:var(--ok)">±${sd.deviation_after_db.toFixed(1)} dB</div><div class="k">40 Hz – 16 kHz, 90 % of the band</div></div>
+        <div class="tile"><div class="k">Predicted (all positions)</div><div class="v">±${b.sides[side].deviation_after_db.toFixed(1)} dB</div><div class="k">from the build</div></div>
+      </div>
+      ${(c.warnings || []).map((w) => `<p class="note" style="color:var(--warn)">${esc(w)}</p>`).join("")}
+      <div class="muted small">Measured ${esc(fmtDate(c.measured))}</div>`;
+  }
+  el.innerHTML = `
+    <div class="card-head"><h2 id="h-chk">Check</h2>${selftest ? `<span class="tag">Self-test · simulated speakers</span>` : ""}</div>
+    <p class="muted small" style="margin:0">${selftest ? "Measures the simulated speakers through the correction." : "Put the microphone back at the main seat (position 1). This measures through the room correction and compares with the measurement there before. About 25 seconds."}</p>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+      <button class="btn${c ? "" : " primary"}" type="button" id="c-cmeasure" ${busy ? "disabled" : ""}>${c ? "Check again" : "Check the result"}</button></div>
+    ${res}`;
+  $("#c-cmeasure").addEventListener("click", () => measureCheck(selftest));
+  el.querySelectorAll("[data-cside]").forEach((x) => x.addEventListener("click", () => { calState.checkSide = x.dataset.cside; renderCheck(); }));
+}
+
+async function measureCheck(selftest) {
+  if (!selftest) {
+    const ok = await confirmDialog({
+      title: "Check the result?",
+      text: "<p>Put the microphone at the main seat (position 1), at ear height, pointing at the ceiling, and keep quiet. Sweeps play through left + sub, then right + sub, with the room correction on.</p>",
+      ok: "Measure",
+    });
+    if (!ok) return;
+  }
+  try {
+    calState.job = await api("/api/measure/check", { method: "POST", body: JSON.stringify({ selftest }) });
+    renderJob(); renderCheck();
+    pollJob();
+  } catch (e) {
+    set("c-hint", `<span style="color:var(--bad)">${esc(e.message)}</span>`);
+  }
 }
 
 async function applyRoom() {
@@ -555,7 +779,7 @@ async function applyRoom() {
   try {
     await api("/api/room/apply", { method: "POST" });
     await poll();
-    renderRoom(); renderResult();
+    renderRoom(); renderResult(); renderCheck();
     $("#c-rmsg") && ($("#c-rmsg").textContent = "Applied.");
   } catch (e) {
     const m = $("#c-rmsg"); if (m) { m.className = "msg bad"; m.textContent = e.message; }
