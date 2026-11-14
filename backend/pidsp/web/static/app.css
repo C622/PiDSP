@@ -21,6 +21,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; background: var(--bg); color: var(--text); }
 body { font: 14px/1.45 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; min-height: 100vh; }
 a { color: var(--link); }

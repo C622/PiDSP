@@ -45,7 +45,9 @@ DEFAULT_HARDWARE = {
 }
 
 # Where the measurement player's sweeps come in (snd-aloop).
-LOOPBACK_CAPTURE = {"type": "Alsa", "device": "hw:CARD=Loopback,DEV=1", "format": "S32_LE"}
+LOOPBACK_CAPTURE = {"type": "Alsa", "device": "hw:CARD=Loopback,DEV=1,SUBDEV=0", "format": "S32_LE"}
+# The player writes here; the loopback hands it to LOOPBACK_CAPTURE.
+LOOPBACK_PLAYER = "hw:CARD=Loopback,DEV=0,SUBDEV=0"
 
 SUB_FADER = "Aux1"
 SUB_VOLUME_RAMP_MS = 200

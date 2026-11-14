@@ -101,8 +101,14 @@ Apple TV ──HDMI──► TCL C8K ──optical (PCM stereo)──► Pi / CM
 | Stage | Plays | CamillaDSP config | Code |
 |---|---|---|---|
 | A. Bass setup | sweeps on left, right, sub in turn, in one recording | `config.measure_raw()`: 3 loopback inputs straight to the outputs, no filters | `dsp/bass.py`: `complex_responses()`, `align()` |
-| B. Room correction | sweeps on input L, then input R, at 1–5 mic positions | `config.build(plan, measure_side=...)`: the full 2.1 plan, sub fed the measured side at 0 dB | `dsp/calibration.py` (ported): `analyze()`, `combine()`, `fit_fir()` / `timing_correction()` |
-| C. Check | the same as B, with the FIRs active | `config.build(plan, fir=..., measure_side=...)` | `dsp/calibration.py` |
+| B. Room correction | sweeps on input L, then input R, at 1–5 mic positions | `config.build(plan, measure_side=...)`: the full 2.1 plan, sub fed the measured side at 0 dB | `dsp/room.py`: `build()` on `calibration.analyze()`, `combine()`, `fir_correction()` (minimum phase, 8192 taps, no added latency) |
+| C. Check (not built yet) | the same as B, with the FIRs active | `config.build(plan, fir=..., measure_side=...)` | `measure/runner.measure_side(fir=...)` |
+
+The measurement runs in `measure/`:
+- `audio.py` plays and records with `aplay`/`arecord`. Any ALSA overrun or underrun fails the measurement, because dropped samples would shift every later sweep.
+- `runner.py` owns CamillaDSP for the duration of a measurement (`Session`). It loads `measure.yml`, and afterwards it restores the previous config, or stops CamillaDSP if that fails. On start-up, the web service also recovers from a measurement interrupted by a crash or power cut.
+- **Level:** a quiet probe (−40 dBFS on the mains) sets the sweep level so that the microphone peaks around −35 dBFS, about 80 dB SPL on a UMIK-1. The output never goes above −12 dBFS.
+- **Silent self-test:** a second "rig" sends CamillaDSP's output back into the loopback through simulated speakers (CamillaDSP filters with known delays and roll-offs) and records that. On the Pi it recovers the simulated 0.6 ms left/right offset exactly and sums to −0.12 dB at the crossover. Measuring the applied plan and FIRs through it matches the predictions within 0.8 dB (bass plan, 25–400 Hz) and 0.45 dB (FIRs, 30 Hz–16 kHz).
 
 Design decisions:
 - **The measurement player writes to an ALSA loopback** (`snd-aloop`), and CamillaDSP captures from it during measurement. The sweeps then go through exactly the output path used for listening.
@@ -111,7 +117,8 @@ Design decisions:
 - **Sub delay and polarity** come from searching ±30 ms and both polarities for the best summation through the crossover band (fc/2 to 2·fc). Delays a period apart sum about as well at fc, so the tie-break is the candidate whose group delay at fc matches the mains'. Only earlier speakers are ever delayed.
 - **Crossover:** the lowest of 60–120 Hz that is at least 2 × the mains' in-room −6 dB point, kept below the sub's −6 dB point / 1.25.
 - **The sub's Volume filter listens to fader `Aux1`.** The BluOS follower sets Aux1 to (Powernode volume − volume at calibration).
-- **Unverified until the Pi is up:** the CM6206's ALSA card name, which output channel carries the sub (the config feeds both centre and LFE), its S/PDIF capture, and `camilladsp --check` on the generated configs.
+- **Verified on the Pi:** the CM6206 is ALSA card `ICUSBAUDIO7D`, with 8-channel output and S/PDIF as a capture source. The UMIK-1 is card `U18dB` (S24_3LE, 48 kHz only), and its first ~0.3 s after opening is a start-up burst, which the recorder skips. CamillaDSP 4.1.3 accepts every generated config and loads the FIR WAVs.
+- **Still to verify with sound:** which output channel carries the sub (the config feeds both centre and LFE), S/PDIF capture with a live signal, and the first real room measurement.
 
 ## Repository layout (planned)
 

@@ -45,6 +45,9 @@ function engine(s) {
   if (!c) return { kind: "bad", text: "PiDSP not reachable" };
   if (!c.reachable) return { kind: "bad", text: "CamillaDSP not reachable" };
   const rate = c.capture_rate ? ` · ${(c.capture_rate / 1000).toFixed(c.capture_rate % 1000 ? 1 : 0)} kHz` : "";
+  if (s.measuring) return { kind: "warn", text: "Measuring…", input: "In use for measuring" };
+  if (c.config_path?.endsWith("/measure.yml") && c.state !== "Inactive")
+    return { kind: "warn", text: "CamillaDSP running a measurement setup", input: "In use for measuring" };
   switch (c.state) {
     case "Running": return { kind: "ok", text: `CamillaDSP running${rate} · optical locked`, input: "Locked" };
     case "Stalled": return { kind: "warn", text: "CamillaDSP waiting for an optical signal", input: "No signal" };
@@ -59,21 +62,32 @@ function engine(s) {
 const F_MIN = 20, F_MAX = 20000;
 function logspace(n) { return Array.from({ length: n }, (_, i) => F_MIN * Math.pow(F_MAX / F_MIN, i / (n - 1))); }
 
-function chart({ series, yMin = -15, yMax = 15, height = 220, label }) {
-  const W = 640, H = height, L = 34, B = 20, T = 6;
-  const x = (f) => L + ((Math.log10(f) - Math.log10(F_MIN)) / (Math.log10(F_MAX) - Math.log10(F_MIN))) * (W - L);
+function chart({ series, yMin = -15, yMax = 15, height = 220, width = 640, label, fMin = F_MIN, fMax = F_MAX }) {
+  if (window.innerWidth < 700) {  // keep axis text readable on phones
+    width = Math.max(280, window.innerWidth - 74);
+    height = Math.min(height, 240);
+  }
+  const W = width, H = height, L = 34, B = 20, T = 6;
+  const x = (f) => L + ((Math.log10(f) - Math.log10(fMin)) / (Math.log10(fMax) - Math.log10(fMin))) * (W - L);
   const y = (db) => T + ((yMax - Math.max(yMin, Math.min(yMax, db))) / (yMax - yMin)) * (H - T - B);
+  const inRange = (f) => f >= fMin && f <= fMax;
   let g = "";
-  for (const f of [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000])
+  for (const f of [20, 30, 40, 50, 60, 80, 100, 200, 300, 500, 1000, 2000, 5000, 10000, 20000].filter(inRange))
     g += `<line class="grid-line" x1="${x(f)}" x2="${x(f)}" y1="${T}" y2="${H - B}"/>`;
   for (let db = Math.ceil(yMin / 5) * 5; db <= yMax; db += 5) {
     g += `<line class="grid-line" x1="${L}" x2="${W}" y1="${y(db)}" y2="${y(db)}"/>`;
     if (db % 10 === 0) g += `<text class="axis" x="${L - 6}" y="${y(db) + 4}" text-anchor="end">${minus(db > 0 ? "+" + db : db)}</text>`;
   }
-  for (const [f, t] of [[20, "20"], [100, "100"], [1000, "1k"], [10000, "10k"], [20000, "20k Hz"]])
-    g += `<text class="axis" x="${x(f)}" y="${H - 4}" text-anchor="${f === 20 ? "start" : f === 20000 ? "end" : "middle"}">${t}</text>`;
+  const ticks = fMax <= 2000 ? [[20, "20"], [50, "50"], [100, "100"], [200, "200"], [500, "500"], [1000, "1k"], [2000, "2k"]]
+    : [[20, "20"], [100, "100"], [1000, "1k"], [10000, "10k"], [20000, "20k"]];
+  const shown = ticks.filter(([f]) => inRange(f));
+  shown.forEach(([f, t], i) => {
+    const last = i === shown.length - 1;
+    g += `<text class="axis" x="${x(f)}" y="${H - 4}" text-anchor="${i === 0 ? "start" : last ? "end" : "middle"}">${t}${last ? " Hz" : ""}</text>`;
+  });
   const paths = series.map((s) => {
-    const d = s.f.map((f, i) => `${i ? "L" : "M"}${x(f).toFixed(1)},${y(s.db[i]).toFixed(1)}`).join("");
+    const pts = s.f.map((f, i) => [f, s.db[i]]).filter(([f]) => inRange(f));
+    const d = pts.map(([f, db], i) => `${i ? "L" : "M"}${x(f).toFixed(1)},${y(db).toFixed(1)}`).join("");
     return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.width || 1.8}"${s.dash ? ' stroke-dasharray="5 4"' : ""} stroke-linejoin="round"/>`;
   }).join("");
   return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">${g}${paths}</svg></div>`;
@@ -109,13 +123,42 @@ const legend = (after = "After") => `<div class="legend">
 
 const EXAMPLE_TAG = `<span class="tag example" title="Example data until you calibrate">Example</span>`;
 
-const exampleBass = `<div class="tiles">
-  <div class="tile"><div class="k">Crossover</div><div class="v">80 Hz</div><div class="k">LR4, 24 dB/oct</div></div>
-  <div class="tile"><div class="k">Left delay</div><div class="v">11.55 ms</div><div class="k">level 0.0 dB</div></div>
-  <div class="tile"><div class="k">Right delay</div><div class="v">10.95 ms</div><div class="k">level −0.8 dB</div></div>
-  <div class="tile"><div class="k">Sub</div><div class="v">0.00 ms</div><div class="k">+1.5 dB · polarity inverted</div></div>
-  <div class="tile"><div class="k">Summation</div><div class="v" style="color:var(--ok)">−0.3 dB</div><div class="k">mains + sub at crossover</div></div>
-</div>`;
+const EXAMPLE_PLAN = {
+  crossover_hz: 80, crossover_order: 4, summation_db: -0.3,
+  channels: { left: { delay_ms: 11.55, trim_db: 0 }, right: { delay_ms: 10.95, trim_db: -0.8 }, sub: { delay_ms: 0, trim_db: 1.5, inverted: true } },
+};
+const fmtDb = (v) => minus(`${v > 0 ? "+" : ""}${Number(v).toFixed(1)} dB`);
+
+function bassTiles(plan) {
+  const ch = plan.channels, sum = plan.summation_db;
+  const tile = (k, v, sub, style = "") => `<div class="tile"><div class="k">${k}</div><div class="v"${style}>${v}</div><div class="k">${sub}</div></div>`;
+  return `<div class="tiles">
+    ${tile("Crossover", `${plan.crossover_hz} Hz`, `LR${plan.crossover_order || 4}, ${6 * (plan.crossover_order || 4)} dB/oct`)}
+    ${tile("Left delay", `${ch.left.delay_ms.toFixed(2)} ms`, `level ${fmtDb(ch.left.trim_db)}`)}
+    ${tile("Right delay", `${ch.right.delay_ms.toFixed(2)} ms`, `level ${fmtDb(ch.right.trim_db)}`)}
+    ${tile("Sub delay", `${ch.sub.delay_ms.toFixed(2)} ms`, `${fmtDb(ch.sub.trim_db)}${ch.sub.inverted ? " · polarity inverted" : ""}`)}
+    ${tile("Summation", fmtDb(sum), "mains + sub at crossover", sum > -1 ? ' style="color:var(--ok)"' : sum > -3 ? ' style="color:var(--warn)"' : ' style="color:var(--bad)"')}
+  </div>`;
+}
+const exampleBass = bassTiles(EXAMPLE_PLAN);
+
+function fmtDate(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+// A modal yes/no question. Resolves true when confirmed.
+function confirmDialog({ title, text, ok, danger = false }) {
+  const dlg = $("#dlg");
+  $("#dlg-q").textContent = title;
+  $("#dlg-t").innerHTML = text;
+  const okBtn = $("#dlg-ok");
+  okBtn.textContent = ok;
+  okBtn.className = danger ? "btn danger" : "btn primary";
+  dlg.returnValue = "";
+  dlg.showModal();
+  return new Promise((resolve) => { dlg.onclose = () => resolve(dlg.returnValue === "ok"); });
+}
 
 // ---------- pages ----------
 
@@ -141,14 +184,7 @@ const dashboard = {
       <div class="switch-row"><div><div style="font-weight:500">Loudness</div><div class="muted small">Fuller bass and treble at low volume</div></div>
         <button type="button" class="switch" aria-pressed="false" aria-label="Loudness" disabled></button></div>
     </section>
-    <section class="card" aria-labelledby="h-cal"><h2 id="h-cal">Calibration</h2>
-      <div class="empty"><div class="title">Not calibrated yet</div>
-        <div class="muted small">Measure the room with the UMIK-1 to set up the crossover, delays and room correction.</div></div>
-      <div class="seg" role="group" aria-label="Compare">
-        <button type="button" aria-pressed="false" disabled>Corrected</button>
-        <button type="button" aria-pressed="true" disabled>Bypass</button></div>
-      <a class="small" href="#/calibrate" style="font-weight:500">Go to calibration →</a>
-    </section>
+    <section class="card" aria-labelledby="h-cal"><h2 id="h-cal">Calibration</h2><div id="d-cal" style="display:contents"></div></section>
   </div>
   <div class="grid wide">
     <section class="card" aria-labelledby="h-lv"><div class="card-head"><h2 id="h-lv">Levels</h2><span class="tiny muted" id="d-lvnote">dBFS</span></div>
@@ -156,11 +192,9 @@ const dashboard = {
         ${["In L", "In R", "Out L", "Out R", "Out Sub"].map((n, i) => `<span class="muted">${n}</span><div class="meter${i === 4 ? " sub" : ""}"><div id="m${i}"></div></div><span class="mono" style="text-align:right" id="v${i}">—</span>`).join("")}
       </div>
     </section>
-    <section class="card" aria-labelledby="h-rsp"><div class="card-head"><h2 id="h-rsp">At the seat</h2>${EXAMPLE_TAG}</div>
-      ${legend()}${exampleChart()}
-    </section>
+    <section class="card" aria-labelledby="h-rsp" id="d-rsp"></section>
   </div>
-  <section class="card" aria-labelledby="h-bm"><div class="card-head"><h2 id="h-bm">Bass management</h2>${EXAMPLE_TAG}</div>${exampleBass}</section>
+  <section class="card" aria-labelledby="h-bm" id="d-bm"></section>
   <footer class="foot" id="d-foot"></footer>`,
   update(s) {
     const c = s.camilladsp || {}, d = s.devices || {}, e = engine(s);
@@ -171,6 +205,23 @@ const dashboard = {
       ["DSP load", c.load != null && c.state === "Running" ? `<span class="mono">${c.load.toFixed(1)} %</span>` : "—"],
       ["Latency", "Set when calibrated"],
     ].map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join(""));
+    const cal = s.calibration;
+    set("d-cal", cal ? `
+      <div><div style="font-size:18px;font-weight:600">${cal.room ? `Room correction · ${TARGET_NAMES[cal.room.target]} target` : `Bass setup · ${cal.plan.crossover_hz} Hz crossover`}</div>
+        <div class="muted small">Applied ${esc(fmtDate(cal.applied))}${cal.room ? ` · ${cal.room.positions} mic position${cal.room.positions === 1 ? "" : "s"}` : ". Room correction comes next."}</div></div>
+      ${cal.room ? `<div class="row small"><span>Predicted deviation</span><span class="mono">±${cal.room.sides.left.deviation_after_db.toFixed(1)} dB (was ±${cal.room.sides.left.deviation_before_db.toFixed(1)})</span></div>` : ""}
+      <div class="row small"><span>Summation at crossover</span><span class="mono">${fmtDb(cal.plan.summation_db)}</span></div>
+      <a class="small" href="#/filters" style="font-weight:500">Open filters →</a>` : `
+      <div class="empty"><div class="title">Not calibrated yet</div>
+        <div class="muted small">Measure the room with the UMIK-1 to set up the crossover, delays and room correction.</div></div>
+      <a class="small" href="#/calibrate" style="font-weight:500">Go to calibration →</a>`);
+    const rc = cal?.room?.curves;
+    set("d-rsp", `<div class="card-head"><h2 id="h-rsp">At the seat</h2>${rc ? `<span class="muted small">left + sub · ${TARGET_NAMES[cal.room.target]} target</span>` : EXAMPLE_TAG}</div>
+      ${legend()}${rc ? chart({ label: "Measured and corrected response at the seat, left side", series: [
+        { f: rc.freq, db: rc.target, color: "#8C939E", dash: true, width: 1.4 },
+        { f: rc.freq, db: rc.left_measured, color: "#F2A93B", width: 1.6 },
+        { f: rc.freq, db: rc.left_predicted, color: "#5AA9FF", width: 2 }] }) : exampleChart()}`);
+    set("d-bm", `<div class="card-head"><h2 id="h-bm">Bass management</h2>${cal ? `<a class="small" href="#/filters">Details →</a>` : EXAMPLE_TAG}</div>${bassTiles(cal ? cal.plan : EXAMPLE_PLAN)}`);
     footer("d-foot", s);
     levels.wanted = c.state === "Running";
     if (!levels.wanted) {
@@ -216,44 +267,353 @@ const levels = {
 };
 
 const STEPS = ["Prepare", "Bass setup", "Room correction", "Build filters", "Check"];
+const calState = { job: null, bass: null, mic: null, room: null, side: "left", roomSide: "left", target: "room", timer: null };
+const TARGET_NAMES = { flat: "Neutral", warm: "Warm", room: "Room" };
+const C_MAIN = "#F2A93B", C_SUB = "#B48CF2", C_SUM = "#5AA9FF";
 
 const calibrate = {
   title: "Calibrate",
   html: () => `
   <div class="head"><div><h1>Calibrate</h1><p>About 15 minutes. The room should be quiet while sweeps play.</p></div></div>
-  <ol class="steps" aria-label="Calibration steps">${STEPS.map((t, i) => `<li${i === 0 ? ' aria-current="step"' : ""}>${t}</li>`).join("")}</ol>
+  <ol class="steps" aria-label="Calibration steps" id="c-steps"></ol>
+  <section class="card" id="c-job" aria-live="polite" hidden></section>
+  <section class="card" id="c-result" aria-labelledby="h-res" hidden></section>
+  <section class="card" id="c-room" aria-labelledby="h-room2" hidden></section>
   <div class="grid wide">
     <section class="card" aria-labelledby="h-chk"><h2 id="h-chk">Before you start</h2>
       <ul class="checks" id="c-checks"></ul>
       <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
-        <button class="btn primary" type="button" disabled>Start bass setup</button>
-        <span class="muted small">Measuring arrives in the next version.</span>
+        <button class="btn primary" type="button" id="c-start" disabled>Start bass setup</button>
+        <button class="btn" type="button" id="c-selftest" disabled title="Measures simulated speakers inside the Pi. Makes no sound.">Silent self-test</button>
       </div>
+      <p class="muted small" style="margin:0" id="c-hint" role="status"></p>
     </section>
-    <section class="card" aria-labelledby="h-room"><h2 id="h-room">Microphone positions</h2>
-      ${roomSvg()}
-      <ol class="small muted" style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:4px">
-        <li>Bass setup: the mic at your main seat, ear height, pointing at the ceiling.</li>
-        <li>Room correction: 5 positions in a small area around the seat, about 30 cm apart.</li>
-        <li>Keep still and quiet while each sweep plays.</li>
-      </ol>
-    </section>
+    <div style="display:flex;flex-direction:column;gap:20px;min-width:0">
+      <section class="card" aria-labelledby="h-mic"><h2 id="h-mic">Microphone calibration</h2>
+        <div id="c-mic"></div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+          <button class="btn" type="button" id="c-micbtn">Upload calibration file…</button>
+          <input type="file" id="c-micfile" accept=".txt,.cal,.frd,text/plain" hidden>
+          <button class="btn" type="button" id="c-micdel" hidden>Remove</button>
+          <span class="msg" id="c-micmsg" role="status"></span>
+        </div>
+      </section>
+      <section class="card" aria-labelledby="h-room"><h2 id="h-room">Microphone positions</h2>
+        ${roomSvg()}
+        <ol class="small muted" style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:4px">
+          <li>Bass setup: the mic at your main seat, ear height, pointing at the ceiling.</li>
+          <li>Room correction: 5 positions in a small area around the seat, about 30 cm apart.</li>
+          <li>Keep still and quiet while each sweep plays.</li>
+        </ol>
+      </section>
+    </div>
   </div>`,
+  async mount() {
+    $("#c-start").addEventListener("click", startBass);
+    $("#c-selftest").addEventListener("click", () => runBass(true));
+    $("#c-micbtn").addEventListener("click", () => $("#c-micfile").click());
+    $("#c-micfile").addEventListener("change", uploadMic);
+    $("#c-micdel").addEventListener("click", deleteMic);
+    try {
+      const [mic, bass, job, room] = await Promise.all([api("/api/mic"), api("/api/bass"), api("/api/measure/job"), api("/api/room")]);
+      calState.mic = mic.calibration; calState.bass = bass.result; calState.job = job; calState.room = room;
+      if (room.build) calState.target = room.build.target;
+    } catch (_) { /* shown by the status pill */ }
+    renderMic(); renderResult(); renderRoom(); renderJob();
+    if (status) calibrate.update(status);
+    if (calState.job?.state === "running") pollJob();
+  },
+  unmount() { clearTimeout(calState.timer); },
   update(s) {
     const d = s.devices || {}, c = s.camilladsp || {}, e = engine(s);
     const mic = d.mic || {};
     const items = [
       [d.dac?.present ? "ok" : "bad", "Sound card", d.dac?.present ? "CM6206 connected" : "CM6206 not found. Check the USB cable."],
-      [mic.present ? "ok" : "warn", "Measurement microphone", mic.present ? `${esc(mic.name)} connected${mic.gain_db != null ? ` · ${mic.gain_db} dB gain version` : ""}` : "Plug the UMIK-1 into the Pi."],
-      ["", "Microphone calibration file", `Upload the file for your mic's serial number (on its label)${mic.gain_db === 18 ? ", 18 dB gain version" : ""}. Coming in the next version.`],
+      [mic.card ? "ok" : "warn", "Measurement microphone", mic.card ? `${esc(mic.name)} connected${mic.gain_db != null ? ` · ${mic.gain_db} dB gain version` : ""}` : "Plug the UMIK-1 into the Pi."],
+      [calState.mic ? "ok" : "warn", "Microphone calibration file", calState.mic ? `Serial ${esc(calState.mic.serial || "unknown")}` : "Recommended: upload it on the right."],
       [c.reachable ? "ok" : "bad", "DSP engine", c.reachable ? `CamillaDSP ${esc(c.version)} ready` : "CamillaDSP is not running."],
       [d.loopback?.present ? "ok" : "bad", "Measurement path", d.loopback?.present ? "ALSA loopback ready" : "ALSA loopback missing. Rerun the install script."],
       ["", "Speaker level", "Set the Powernode to your usual listening volume, then leave it there."],
       [e.input === "Locked" ? "ok" : "", "Optical input", e.input === "Locked" ? "Signal locked" : "Not needed for measuring"],
     ];
     set("c-checks", items.map(([k, what, how]) => `<li>${dot(k)}<div><div class="what">${what}</div><div class="muted small">${how}</div></div></li>`).join(""));
+    const busy = calState.job?.state === "running" || s.measuring;
+    const base = c.reachable && d.loopback?.present && !busy;
+    const ready = base && d.dac?.present && mic.card;
+    $("#c-start").disabled = !ready;
+    $("#c-selftest").disabled = !base;
+    $("#c-start").textContent = calState.bass && !calState.bass.selftest ? "Measure bass again" : "Start bass setup";
+    set("c-hint", busy ? "A measurement is running." : !c.reachable ? "Waiting for CamillaDSP." : !d.dac?.present ? "Connect the sound card to start." : !mic.card ? "Connect the microphone to start." : "");
+    const room = calState.room;
+    const step = room?.build ? 3 : calState.bass ? 2 : busy ? 1 : 0;
+    set("c-steps", STEPS.map((t, i) => `<li${i === step ? ' aria-current="step"' : ""}>${t}</li>`).join(""));
   },
 };
+
+async function startBass() {
+  const ok = await confirmDialog({
+    title: "Play test sweeps?",
+    text: `<p>Sweeps will play through the left, right and sub speakers, about 40 seconds in all.</p>
+      <ul style="padding-left:18px">
+        <li>Set the Powernode to your normal listening volume, not louder.</li>
+        <li>Put the microphone at your main seat, at ear height, pointing at the ceiling.</li>
+        <li>Keep the room quiet and stay still.</li></ul>
+      <p>The first sound is quiet. PiDSP sets the sweep level from what the microphone hears, up to a safe maximum.</p>
+      ${calState.mic ? "" : "<p style='color:var(--warn)'>No microphone calibration file yet. The bass setup still works.</p>"}`,
+    ok: "Start",
+  });
+  if (ok) runBass(false);
+}
+
+async function runBass(selftest) {
+  try {
+    calState.job = await api("/api/measure/bass", { method: "POST", body: JSON.stringify({ selftest }) });
+    renderJob();
+    if (status) calibrate.update(status);
+    pollJob();
+  } catch (e) {
+    set("c-hint", `<span style="color:var(--bad)">${esc(e.message)}</span>`);
+  }
+}
+
+async function pollJob() {
+  clearTimeout(calState.timer);
+  try {
+    calState.job = await api("/api/measure/job");
+  } catch (_) { /* try again */ }
+  renderJob();
+  if (calState.job?.state === "running") {
+    calState.timer = setTimeout(pollJob, 700);
+    return;
+  }
+  if (calState.job?.state === "done") {
+    const roomJob = calState.job.kind.startsWith("room");
+    if (!roomJob) calState.bass = (await api("/api/bass")).result;
+    calState.room = await api("/api/room");
+    renderResult(); renderRoom();
+    $(roomJob ? "#c-room" : "#c-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  if (status) calibrate.update(status);
+}
+
+function renderJob() {
+  const el = $("#c-job");
+  if (!el) return;
+  const j = calState.job;
+  if (!j || j.state === "idle" || j.state === "done") { el.hidden = true; return; }
+  el.hidden = false;
+  const kind = j.kind.endsWith("selftest") ? `<span class="tag">Silent self-test</span>` : "";
+  if (j.state === "running") {
+    el.innerHTML = `<div class="card-head"><h2>Measuring</h2>${kind}</div>
+      <div style="font-size:18px;font-weight:600">${esc(j.step)}…</div>
+      <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(j.progress * 100)}"><div style="width:${j.progress * 100}%;background:var(--measured)"></div></div>
+      <div><button class="btn" type="button" id="c-cancel">Cancel</button></div>`;
+    $("#c-cancel").addEventListener("click", () => api("/api/measure/cancel", { method: "POST" }).then(pollJob));
+  } else {
+    const failed = j.state === "failed";
+    el.innerHTML = `<div class="card-head"><h2>${failed ? "Measurement failed" : "Measurement cancelled"}</h2>${kind}</div>
+      <p style="margin:0;display:flex;gap:10px">${dot(failed ? "bad" : "")}<span>${failed ? esc(j.error) : "Nothing was changed."}</span></p>`;
+  }
+}
+
+function renderResult() {
+  const el = $("#c-result");
+  if (!el) return;
+  const r = calState.bass;
+  if (!r) { el.hidden = true; return; }
+  el.hidden = false;
+  const plan = r.plan, c = r.curves, side = calState.side;
+  const applied = status?.calibration && JSON.stringify(status.calibration.plan) === JSON.stringify(plan);
+  const verdict = r.verdict ? `<ul class="checks">${r.verdict.checks.map((k) => `<li>${dot(k.ok ? "ok" : "bad")}<div><div class="what">${esc(k.what)}: ${esc(k.got)}</div><div class="muted small">expected ${esc(k.expected)}</div></div></li>`).join("")}</ul>
+    <p class="note">${r.verdict.passed ? "Passed. The measurement chain on this Pi works end to end." : "Failed. Something in the measurement chain is off; the details above show what."}</p>` : "";
+  el.innerHTML = `
+    <div class="card-head"><h2 id="h-res">${r.selftest ? "Self-test result" : "Bass setup result"}</h2>
+      <span class="tag${r.selftest ? "" : " example"}" style="${r.selftest ? "" : "background:#16273A;color:var(--after)"}">${r.selftest ? "Simulated speakers" : "Measured " + esc(fmtDate(r.measured))}</span></div>
+    ${verdict}
+    <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center">
+      <div class="seg" role="group" aria-label="Side" style="min-width:260px">
+        <button type="button" data-side="left" aria-pressed="${side === "left"}">Left + sub</button>
+        <button type="button" data-side="right" aria-pressed="${side === "right"}">Right + sub</button></div>
+      <div class="legend"><span><i style="background:${C_MAIN}"></i>${side === "left" ? "Left" : "Right"} alone</span><span><i style="background:${C_SUB}"></i>Sub alone</span><span><i style="background:${C_SUM}"></i>Together, with this setup</span></div>
+    </div>
+    ${chart({ fMax: 2000, yMin: -30, yMax: 15, height: 340, width: 1100, label: `Measured ${side} and sub responses and their predicted sum`, series: [
+      { f: c.freq, db: c[side], color: C_MAIN, width: 1.6 },
+      { f: c.freq, db: c.sub, color: C_SUB, width: 1.6 },
+      { f: c.freq, db: c["sum_" + side], color: C_SUM, width: 2.2 },
+    ] })}
+    ${bassTiles(plan)}
+    ${(plan.warnings || []).map((w) => `<p class="note" style="color:var(--warn)">${esc(w)}</p>`).join("")}
+    <div class="muted small">Sweep level ${minus(r.level.sweep_db)} dBFS${r.selftest ? " · digital loopback, no noise" : ` · room noise ${minus(r.level.noise_db)} dBFS at the microphone · ${r.mic_calibrated ? "microphone calibration applied" : "no microphone calibration"}`}</div>
+    ${r.selftest ? "" : `<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+      <button class="btn primary" type="button" id="c-apply" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Apply bass setup"}</button>
+      <span class="muted small">${applied ? "This is the active setup." : "Sound from the TV then goes through this crossover and these delays."}</span></div>`}`;
+  el.querySelectorAll("[data-side]").forEach((b) => b.addEventListener("click", () => { calState.side = b.dataset.side; renderResult(); }));
+  $("#c-apply")?.addEventListener("click", applyBass);
+}
+
+function renderRoom() {
+  const el = $("#c-room");
+  if (!el) return;
+  const r = calState.bass, room = calState.room;
+  if (!r || !room) { el.hidden = true; return; }
+  el.hidden = false;
+  const selftest = !!r.selftest;
+  const current = new Set(room.positions.filter((p) => p.current).map((p) => p.index));
+  const n = room.recommended;
+  const next = Array.from({ length: n }, (_, i) => i + 1).find((i) => !current.has(i));
+  const busy = calState.job?.state === "running";
+  const chips = Array.from({ length: n }, (_, i) => i + 1).map((i) =>
+    `<span class="tag" style="font-size:12px;padding:6px 10px;${current.has(i) ? "background:#16301F;color:var(--ok)" : ""}">${current.has(i) ? "✓ " : ""}Position ${i}</span>`).join("");
+  const b = room.build && room.build.selftest === selftest ? room.build : null;
+  const side = calState.roomSide;
+  let built = "";
+  if (b) {
+    const c = b.curves, sd = b.sides[side];
+    built = `
+      <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center">
+        <div class="seg" role="group" aria-label="Side" style="min-width:260px">
+          <button type="button" data-rside="left" aria-pressed="${side === "left"}">Left + sub</button>
+          <button type="button" data-rside="right" aria-pressed="${side === "right"}">Right + sub</button></div>
+        ${legend("Predicted")}</div>
+      ${chart({ yMin: -15, yMax: 15, height: 300, width: 1100, label: `Room correction for ${side}: measured, target and predicted`, series: [
+        { f: c.freq, db: c.target, color: "#8C939E", dash: true, width: 1.4 },
+        { f: c.freq, db: c[side + "_measured"], color: "#F2A93B", width: 1.6 },
+        { f: c.freq, db: c[side + "_predicted"], color: "#5AA9FF", width: 2.2 },
+      ] })}
+      <div class="tiles">
+        <div class="tile"><div class="k">Deviation before</div><div class="v">±${sd.deviation_before_db.toFixed(1)} dB</div><div class="k">40 Hz – 16 kHz, 90 % of the band</div></div>
+        <div class="tile"><div class="k">Predicted after</div><div class="v" style="color:var(--ok)">±${sd.deviation_after_db.toFixed(1)} dB</div><div class="k">dips are only half filled, on purpose</div></div>
+        <div class="tile"><div class="k">Headroom</div><div class="v">${fmtDb(b.preamp_db)}</div><div class="k">preamp, so boosts can't clip</div></div>
+        <div class="tile"><div class="k">Built from</div><div class="v">${b.positions}</div><div class="k">mic position${b.positions === 1 ? "" : "s"} · ${TARGET_NAMES[b.target]} target</div></div>
+      </div>
+      ${selftest ? "" : `<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+        <button class="btn primary" type="button" id="c-rapply">Apply room correction</button>
+        <span class="muted small">Replaces the current setup with the bass setup plus this correction.</span></div>`}`;
+  }
+  el.innerHTML = `
+    <div class="card-head"><h2 id="h-room2">Room correction</h2>${selftest ? `<span class="tag">Self-test · simulated speakers</span>` : ""}</div>
+    <p class="muted small" style="margin:0">Measures left + sub and right + sub through the bass setup at up to ${n} microphone positions around your seat (see the diagram below). More positions give a correction that holds for a wider area. About 25 seconds each.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">${chips}</div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+      <button class="btn${b ? "" : " primary"}" type="button" id="c-rmeasure" ${busy ? "disabled" : ""}>${next ? `Measure position ${next}` : "All positions measured"}</button>
+      ${current.size ? `<button class="btn" type="button" id="c-rclear" ${busy ? "disabled" : ""}>Start over</button>` : ""}
+    </div>
+    ${current.size ? `<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+      <div class="seg" role="group" aria-label="Target" style="min-width:300px">${room.targets.map((t) => `<button type="button" data-target="${t}" aria-pressed="${calState.target === t}">${TARGET_NAMES[t]}</button>`).join("")}</div>
+      <button class="btn${b ? "" : " primary"}" type="button" id="c-rbuild" ${busy ? "disabled" : ""}>${b ? "Build again" : "Build correction"}</button>
+      <span class="msg" id="c-rmsg" role="status"></span></div>` : ""}
+    ${built}`;
+  if (next === undefined) $("#c-rmeasure").disabled = true;
+  $("#c-rmeasure")?.addEventListener("click", () => measureRoom(next, selftest));
+  $("#c-rclear")?.addEventListener("click", async () => {
+    if (!(await confirmDialog({ title: "Start over?", text: "Removes the room correction measurements. What is applied stays.", ok: "Start over", danger: true }))) return;
+    await api("/api/room", { method: "DELETE" });
+    calState.room = await api("/api/room"); renderRoom();
+  });
+  el.querySelectorAll("[data-target]").forEach((x) => x.addEventListener("click", () => { calState.target = x.dataset.target; renderRoom(); }));
+  el.querySelectorAll("[data-rside]").forEach((x) => x.addEventListener("click", () => { calState.roomSide = x.dataset.rside; renderRoom(); }));
+  $("#c-rbuild")?.addEventListener("click", buildRoom);
+  $("#c-rapply")?.addEventListener("click", applyRoom);
+}
+
+async function measureRoom(position, selftest) {
+  if (!selftest) {
+    const ok = await confirmDialog({
+      title: `Measure position ${position}?`,
+      text: `<p>Put the microphone at position ${position} (see the diagram), at ear height, pointing at the ceiling. Then keep quiet: sweeps play through left + sub, then right + sub, about 25 seconds.</p>`,
+      ok: "Measure",
+    });
+    if (!ok) return;
+  }
+  try {
+    calState.job = await api("/api/measure/room", { method: "POST", body: JSON.stringify({ position, selftest }) });
+    renderJob(); renderRoom();
+    pollJob();
+  } catch (e) {
+    set("c-hint", `<span style="color:var(--bad)">${esc(e.message)}</span>`);
+  }
+}
+
+async function buildRoom() {
+  const msg = $("#c-rmsg");
+  msg.className = "msg"; msg.textContent = "Building…";
+  try {
+    const r = await api("/api/room/build", { method: "POST", body: JSON.stringify({ target: calState.target }) });
+    calState.room.build = r.build;
+    renderRoom();
+    if (status) calibrate.update(status);
+  } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+}
+
+async function applyRoom() {
+  const ok = await confirmDialog({
+    title: "Apply room correction?",
+    text: "<p>Sound from the TV then goes through the bass setup and this correction. When you have finished, run Wireless Audio Sync again on the Apple TV.</p>",
+    ok: "Apply",
+  });
+  if (!ok) return;
+  try {
+    await api("/api/room/apply", { method: "POST" });
+    await poll();
+    renderRoom(); renderResult();
+    $("#c-rmsg") && ($("#c-rmsg").textContent = "Applied.");
+  } catch (e) {
+    const m = $("#c-rmsg"); if (m) { m.className = "msg bad"; m.textContent = e.message; }
+  }
+}
+
+async function applyBass() {
+  const ok = await confirmDialog({
+    title: "Apply this bass setup?",
+    text: "<p>It replaces the current sound setup straight away. When you have finished calibrating, run Wireless Audio Sync again on the Apple TV.</p>",
+    ok: "Apply",
+  });
+  if (!ok) return;
+  try {
+    await api("/api/bass/apply", { method: "POST" });
+    await poll();
+    renderResult();
+  } catch (e) {
+    set("c-hint", `<span style="color:var(--bad)">${esc(e.message)}</span>`);
+  }
+}
+
+function renderMic() {
+  const m = calState.mic;
+  set("c-mic", m ? `<div class="rows">
+      <div class="row"><span>File</span><span class="mono small">${esc(m.filename)}</span></div>
+      <div class="row"><span>Serial</span><span class="mono">${esc(m.serial || "—")}</span></div>
+      <div class="row"><span>Sensitivity</span><span class="mono">${m.sensitivity_db != null ? fmtDb(m.sensitivity_db) : "—"}</span></div>
+      <div class="row"><span>Range</span><span class="mono">${Math.round(m.range_hz[0])} Hz – ${(m.range_hz[1] / 1000).toFixed(0)} kHz</span></div></div>`
+    : `<p class="muted small" style="margin:0">miniDSP has a file for every UMIK-1: look up the serial number on the mic's label on miniDSP's website. Pointing the mic at the ceiling, use the <b>90°</b> file.</p>`);
+  const del = $("#c-micdel");
+  if (del) del.hidden = !m;
+  const btn = $("#c-micbtn");
+  if (btn) btn.textContent = m ? "Replace file…" : "Upload calibration file…";
+}
+
+async function uploadMic(ev) {
+  const file = ev.target.files[0], msg = $("#c-micmsg");
+  ev.target.value = "";
+  if (!file) return;
+  msg.className = "msg"; msg.textContent = "Reading…";
+  try {
+    if (file.size > 1_000_000) throw new Error("That file is too large to be a calibration file.");
+    const r = await api("/api/mic", { method: "PUT", body: JSON.stringify({ filename: file.name, text: await file.text() }) });
+    calState.mic = r.calibration;
+    msg.className = "msg ok"; msg.textContent = "Uploaded.";
+  } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+  renderMic();
+  if (status) calibrate.update(status);
+}
+
+async function deleteMic() {
+  await api("/api/mic", { method: "DELETE" });
+  calState.mic = null;
+  $("#c-micmsg").textContent = "";
+  renderMic();
+  if (status) calibrate.update(status);
+}
 
 function roomSvg() {
   const spk = (x, y, t) => `<rect x="${x - 14}" y="${y - 10}" width="28" height="20" rx="4" fill="#232932" stroke="#3A424D"/><text x="${x}" y="${y + 4}" text-anchor="middle" fill="#E8EAED" font-size="11" font-weight="600">${t}</text>`;
@@ -268,27 +628,38 @@ function roomSvg() {
   </svg>`;
 }
 
+let filtersSide = "left";
 const filters = {
   title: "Filters",
   html: () => `
   <div class="head"><div><h1>Filters</h1><p>Room correction, crossover and delays built from your measurements.</p></div></div>
-  <section class="card"><div class="empty"><div class="title">No filters yet</div>
-    <div class="muted small">Once you have calibrated, the measured response and the planned correction appear here. Then pick a target curve and apply. Below is a preview with example data.</div>
+  <section class="card" id="f-empty"><div class="empty"><div class="title">No room correction yet</div>
+    <div class="muted small">Once you have calibrated, the measured response and the correction appear here. Below is a preview with example data.</div>
     <a class="btn" href="#/calibrate">Go to calibration</a></div></section>
-  <section class="card" aria-labelledby="h-fr"><div class="card-head"><h2 id="h-fr">Response at the seat</h2>${EXAMPLE_TAG}</div>
-    <div class="seg" role="group" aria-label="Channel" style="max-width:360px"><button type="button" aria-pressed="true" disabled>Left + sub</button><button type="button" aria-pressed="false" disabled>Right + sub</button></div>
-    ${legend("Predicted")}${exampleChart()}
-    <div class="grid">
-      <div class="rows"><div class="what" style="font-weight:500">Target</div>
-        <div class="seg" role="group" aria-label="Target"><button type="button" aria-pressed="false" disabled>Neutral</button><button type="button" aria-pressed="false" disabled>Warm</button><button type="button" aria-pressed="true" disabled>Room</button></div></div>
-      <div class="rows"><div class="what" style="font-weight:500">Correction</div>
-        <div class="seg" role="group" aria-label="Correction"><button type="button" aria-pressed="false" disabled>PEQ</button><button type="button" aria-pressed="false" disabled>Detailed</button><button type="button" aria-pressed="true" disabled>FIR</button></div></div>
-    </div>
-  </section>
-  <section class="card" aria-labelledby="h-fb"><div class="card-head"><h2 id="h-fb">Bass management</h2>${EXAMPLE_TAG}</div>${exampleBass}
+  <section class="card" aria-labelledby="h-fr" id="f-resp"></section>
+  <section class="card" aria-labelledby="h-fb"><div id="f-bm" style="display:contents"></div>
     <p class="note">Applying new filters can change PiDSP's latency. Afterwards, run Wireless Audio Sync again on the Apple TV (Settings → Video and Audio → Wireless Audio Sync).</p>
   </section>`,
-  update() {},
+  update(s) {
+    const cal = s.calibration, rc = cal?.room;
+    $("#f-empty").hidden = !!rc;
+    const side = filtersSide;
+    set("f-resp", `<div class="card-head"><h2 id="h-fr">Response at the seat</h2>${rc ? `<span class="muted small">${TARGET_NAMES[rc.target]} target · ${rc.positions} position${rc.positions === 1 ? "" : "s"} · preamp ${fmtDb(rc.preamp_db)}</span>` : EXAMPLE_TAG}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center">
+        <div class="seg" role="group" aria-label="Side" style="min-width:260px">
+          <button type="button" data-fside="left" aria-pressed="${side === "left"}" ${rc ? "" : "disabled"}>Left + sub</button>
+          <button type="button" data-fside="right" aria-pressed="${side === "right"}" ${rc ? "" : "disabled"}>Right + sub</button></div>
+        ${legend("Corrected")}</div>
+      ${rc ? chart({ height: 300, width: 1100, label: `Measured and corrected response, ${side}`, series: [
+        { f: rc.curves.freq, db: rc.curves.target, color: "#8C939E", dash: true, width: 1.4 },
+        { f: rc.curves.freq, db: rc.curves[side + "_measured"], color: "#F2A93B", width: 1.6 },
+        { f: rc.curves.freq, db: rc.curves[side + "_predicted"], color: "#5AA9FF", width: 2.2 }] }) : exampleChart()}
+      ${rc ? `<div class="tiles">
+        <div class="tile"><div class="k">Deviation before</div><div class="v">±${rc.sides[side].deviation_before_db.toFixed(1)} dB</div><div class="k">40 Hz – 16 kHz</div></div>
+        <div class="tile"><div class="k">Corrected (predicted)</div><div class="v" style="color:var(--ok)">±${rc.sides[side].deviation_after_db.toFixed(1)} dB</div><div class="k">minimum-phase FIR, 8192 taps</div></div></div>` : ""}`);
+    document.querySelectorAll("[data-fside]").forEach((b) => b.addEventListener("click", () => { filtersSide = b.dataset.fside; filters.update(status); }));
+    set("f-bm", `<div class="card-head"><h2 id="h-fb">Bass management</h2>${cal ? `<span class="muted small">applied ${esc(fmtDate(cal.applied))}</span>` : EXAMPLE_TAG}</div>${bassTiles(cal ? cal.plan : EXAMPLE_PLAN)}`);
+  },
 };
 
 const systemPage = {
@@ -315,9 +686,7 @@ const systemPage = {
       <div style="display:flex;gap:12px;flex-wrap:wrap"><button class="btn" type="button" data-power="reboot">Restart</button><button class="btn danger" type="button" data-power="poweroff">Shut down</button></div>
       <span class="msg" id="power-msg" role="status"></span>
     </section>
-  </div>
-  <dialog id="power-dlg"><h3 id="power-q"></h3><p class="muted small" id="power-t"></p>
-    <form method="dialog" class="actions"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="ok" id="power-ok"></button></form></dialog>`,
+  </div>`,
   mount() {
     $("#pw-form").addEventListener("submit", async (ev) => {
       ev.preventDefault();
@@ -329,22 +698,19 @@ const systemPage = {
         f.reset(); msg.className = "msg ok"; msg.textContent = "Password changed.";
       } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
     });
-    const dlg = $("#power-dlg");
-    document.querySelectorAll("[data-power]").forEach((b) => b.addEventListener("click", () => {
-      const act = b.dataset.power;
-      $("#power-q").textContent = act === "reboot" ? "Restart PiDSP?" : "Shut down PiDSP?";
-      $("#power-t").textContent = act === "reboot" ? "Sound stops for about a minute while the Pi restarts. This page reconnects by itself." : "You will need to unplug and reconnect power to start it again.";
-      $("#power-ok").textContent = act === "reboot" ? "Restart" : "Shut down";
-      dlg.returnValue = "";
-      dlg.onclose = async () => {
-        if (dlg.returnValue !== "ok") return;
-        const msg = $("#power-msg");
-        try {
-          await api(`/api/system/${act}`, { method: "POST" });
-          msg.className = "msg ok"; msg.textContent = act === "reboot" ? "Restarting…" : "Shutting down…";
-        } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
-      };
-      dlg.showModal();
+    document.querySelectorAll("[data-power]").forEach((b) => b.addEventListener("click", async () => {
+      const act = b.dataset.power, reboot = act === "reboot";
+      const ok = await confirmDialog({
+        title: reboot ? "Restart PiDSP?" : "Shut down PiDSP?",
+        text: reboot ? "Sound stops for about a minute while the Pi restarts. This page reconnects by itself." : "You will need to unplug and reconnect power to start it again.",
+        ok: reboot ? "Restart" : "Shut down", danger: !reboot,
+      });
+      if (!ok) return;
+      const msg = $("#power-msg");
+      try {
+        await api(`/api/system/${act}`, { method: "POST" });
+        msg.className = "msg ok"; msg.textContent = reboot ? "Restarting…" : "Shutting down…";
+      } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
     }));
   },
   update(s) {
@@ -390,6 +756,7 @@ let page = null;
 
 function route() {
   const key = location.hash.replace(/^#\/?/, "").split("/")[0];
+  page?.unmount?.();
   page = ROUTES[key] || dashboard;
   document.querySelectorAll(".nav a").forEach((a) => (a.dataset.route === (ROUTES[key] ? key : "") ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current")));
   document.title = page === dashboard ? "PiDSP" : `${page.title} · PiDSP`;

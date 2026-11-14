@@ -82,3 +82,7 @@ deploy/install-web.sh <user>@PiDSP.local
 This copies the backend to `/opt/pidsp/app` and runs it as `pidsp-web.service` on port 80. Open **http://PiDSP.local**. Python dependencies come from Debian packages, so nothing is compiled on the Pi. The service runs as an unprivileged `pidsp-web` user. The only thing it may run as root is `/usr/local/sbin/pidsp-admin`, which can change the login password, restart or shut down. Re-run the script to deploy new code.
 
 There is no login on the web interface, as with moOde. Keep PiDSP on your home network; don't expose it to the internet.
+
+## 6. Check the measurement chain (silent)
+
+On the Calibrate page, **Silent self-test** measures simulated speakers inside the Pi: CamillaDSP's output goes back into the ALSA loopback instead of the sound card. It plays nothing. It should report *Passed* in about 40 seconds. It checks the loopback, CamillaDSP, the recorder and the analysis together, before any sweep goes to real speakers.
