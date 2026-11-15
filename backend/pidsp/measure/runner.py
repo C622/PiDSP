@@ -194,6 +194,69 @@ def choose_sweep_level(session: Session, rig: Rig, channels: int) -> dict:
     return out
 
 
+# A level check differing by this much from the calibration is reported.
+LEVEL_CHANGE_DB = 3.0
+
+
+def level_check(session: Session, rig: Rig) -> dict:
+    """The quiet probes of the bass setup again (mains, then the sub on its
+    own, about 5 s of quiet sound): how loud each arrives at the microphone
+    now. Raw, without the bass plan or the sub level, like the calibration."""
+    session.progress("Loading the measurement setup", 0.1)
+    session.load(rig.decorate(cfgmod.measure_raw(hardware=rig.hardware)))
+    session.check()
+    session.progress("Playing two quiet test sounds", 0.3)
+    return choose_sweep_level(session, rig, 3)
+
+
+def compare_levels(now: dict, calibrated: dict, volume_change_db: float | None) -> dict:
+    """Compare a level check with the bass setup measurement's probes.
+
+    volume_change_db: how much louder the amplifier is set now than during
+    the calibration (it drives the mains only), or None if unknown.
+    Returns the changes in dB, a verdict ("ok", "sub_quieter", "sub_louder",
+    "moved" or "unsure") and a message for the listener.
+    """
+    vol = volume_change_db or 0.0
+    mains = round(now["probe_peak_db"] - calibrated["probe_peak_db"] - vol, 1)
+    sub = round(now["sub"]["probe_peak_db"] - calibrated["sub"]["probe_peak_db"], 1)
+    out = {"mains_change_db": mains, "sub_change_db": sub, "volume_change_db": volume_change_db}
+    if abs(mains) >= LEVEL_CHANGE_DB:
+        # The mains moved too: the microphone is somewhere else (or the
+        # amplifier volume is unknown). The sub against the mains still tells.
+        rel = round(sub - mains, 1)
+        out["sub_vs_mains_db"] = rel
+        if volume_change_db is None:
+            out["verdict"] = "unsure"
+            out["message"] = (f"The main speakers measure {abs(mains):.0f} dB {'louder' if mains > 0 else 'quieter'} than "
+                              "at calibration, and PiDSP cannot read the amplifier's volume to tell why. Set the "
+                              "amplifier to the volume it had when you calibrated, put the microphone at the main "
+                              "seat, and check again.")
+        else:
+            out["verdict"] = "moved"
+            out["message"] = (f"The main speakers measure {abs(mains):.0f} dB {'louder' if mains > 0 else 'quieter'} than "
+                              "at calibration, so the microphone is probably not where it was. Put it at the main "
+                              "seat, at ear height, pointing at the ceiling, and check again."
+                              + (f" (Against the main speakers, the sub is {abs(rel):.0f} dB "
+                                 f"{'louder' if rel > 0 else 'quieter'}.)" if abs(rel) >= LEVEL_CHANGE_DB else ""))
+        return out
+    if sub <= -LEVEL_CHANGE_DB:
+        out["verdict"] = "sub_quieter"
+        out["message"] = (f"The sub is {-sub:.0f} dB quieter than when PiDSP was calibrated. Was its level turned down "
+                          "in its own app or on the sub? Set it back there. Or, to keep it where it is, raise "
+                          f"PiDSP's sub level by {-sub:.0f} dB on the dashboard.")
+    elif sub >= LEVEL_CHANGE_DB:
+        out["verdict"] = "sub_louder"
+        out["message"] = (f"The sub is {sub:.0f} dB louder than when PiDSP was calibrated. Was its level turned up "
+                          "in its own app or on the sub? Set it back there. Or, to keep it where it is, lower "
+                          f"PiDSP's sub level by {sub:.0f} dB on the dashboard.")
+    else:
+        out["verdict"] = "ok"
+        out["message"] = (f"The sub and the main speakers play as they did at calibration (within "
+                          f"{LEVEL_CHANGE_DB:.0f} dB).")
+    return out
+
+
 def measure_bass(session: Session, rig: Rig, mic_curve: np.ndarray | None = None) -> dict:
     """Stage A: left, right and sub raw, in one recording. Returns plan, curves and details."""
     p = session.progress

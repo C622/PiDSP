@@ -161,6 +161,24 @@ function confirmDialog({ title, text, ok, danger = false }) {
   return new Promise((resolve) => { dlg.onclose = () => resolve(dlg.returnValue === "ok"); });
 }
 
+// A modal question with one text field. Resolves the text, or null.
+async function promptDialog({ title, text = "", label, value = "", ok }) {
+  const ok_ = await confirmDialogOpen({ title, ok,
+    text: `${text}<label class="field" style="margin-top:8px">${esc(label)}<input type="text" id="dlg-in" maxlength="60" value="${esc(value)}" autocomplete="off"></label>` });
+  const v = $("#dlg-in")?.value.trim();
+  return ok_ && v ? v : null;
+}
+
+function confirmDialogOpen(opts) {
+  const p = confirmDialog(opts);
+  const input = $("#dlg-in");
+  if (input) {
+    input.focus(); input.select();
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("#dlg-ok").click(); } });
+  }
+  return p;
+}
+
 // ---------- pages ----------
 
 const dashboard = {
@@ -194,7 +212,7 @@ const dashboard = {
       </form>
       <span class="msg" id="v-msg" role="status"></span>
     </section>
-    <section class="card" aria-labelledby="h-cal"><h2 id="h-cal">Calibration</h2><div id="d-cal" style="display:contents"></div></section>
+    <section class="card" aria-labelledby="h-cal"><h2 id="h-cal">Calibration</h2><div id="d-preset"></div><div id="d-cal" style="display:contents"></div></section>
   </div>
   <div class="grid wide">
     <section class="card" aria-labelledby="h-lv"><div class="card-head"><h2 id="h-lv">Levels</h2><span class="tiny muted" id="d-lvnote">dBFS</span></div>
@@ -207,6 +225,7 @@ const dashboard = {
   <section class="card" aria-labelledby="h-bm" id="d-bm"></section>
   <footer class="foot" id="d-foot"></footer>`,
   mount() {
+    loadDashPresets();
     $("#d-cal").addEventListener("click", async (ev) => {
       const b = ev.target.closest("[data-ab]");
       if (!b || b.getAttribute("aria-pressed") === "true") return;
@@ -296,6 +315,30 @@ const dashboard = {
 
 const volumeUi = { editHost: false };
 
+async function loadDashPresets() {
+  const el = $("#d-preset");
+  if (!el) return;
+  let ps;
+  try { ps = await api("/api/presets"); } catch (_) { return; }
+  const usable = ps.presets.filter((p) => p.bass_measured);
+  if (usable.length < 2) { el.innerHTML = ""; return; }
+  el.innerHTML = `<label class="field small">Preset
+    <select id="d-presel">${ps.applied ? "" : `<option value="" selected>—</option>`}${usable.map((p) =>
+      `<option value="${p.id}"${p.id === ps.applied ? " selected" : ""}>${esc(p.name)}${p.build ? ` · ${TARGET_NAMES[p.build.target]}` : " · bass only"}</option>`).join("")}</select></label>
+    <span class="msg small" id="d-premsg" role="status"></span>`;
+  $("#d-presel").addEventListener("change", async (ev) => {
+    const pid = ev.target.value, m = $("#d-premsg");
+    if (!pid) return;
+    ev.target.disabled = true; m.className = "msg small"; m.textContent = "Applying…";
+    try {
+      await api(`/api/presets/${pid}/apply`, { method: "POST" });
+      m.textContent = "";
+      await poll();
+    } catch (e) { m.className = "msg small bad"; m.textContent = e.message; }
+    loadDashPresets();
+  });
+}
+
 function renderVolume(s) {
   const v = s?.volume;
   if (!v || !$("#v-big")) return;
@@ -316,6 +359,9 @@ function renderVolume(s) {
   }
   rows.push(["Sub now", g.mute ? `<span style="color:var(--warn)">muted: ${esc(g.mute_reason)}</span>`
     : `<span class="mono">${fmtDb(g.fader_db ?? 0)}</span>${g.following ? ` <span class="muted small">(level ${fmtDb(g.sub_level_db ?? 0)}, volume ${fmtDb(g.offset_db ?? 0)})</span>` : ""}${g.clamped ? ` <span style="color:var(--warn)" class="small">at its maximum</span>` : ""}`]);
+  if (g.clamped && !g.mute) rows.push(["", `<span style="color:var(--warn)" class="small">PiDSP can't raise the sub further without clipping (you asked for ${fmtDb(g.wanted_db)}). For more, turn the sub up in its own app or on the sub.</span>`]);
+  const lc = s.level_check;
+  if (lc && lc.verdict && lc.verdict !== "ok") rows.push(["Level check", `<span style="color:var(--warn)" class="small">${esc(lc.message)} <a href="#/calibrate">Check again</a></span>`]);
   set("v-rows", rows.map(([k, val]) => `<div class="row"><span>${k}</span><span>${val}</span></div>`).join(""));
   const slider = $("#v-sub");
   if (document.activeElement !== slider) {
@@ -374,10 +420,12 @@ const calibrate = {
   html: () => `
   <div class="head"><div><h1>Calibrate</h1><p>About 15 minutes. The room should be quiet while sweeps play.</p></div></div>
   <ol class="steps" aria-label="Calibration steps" id="c-steps"></ol>
+  <section class="card" id="c-presets" aria-labelledby="h-pre"></section>
   <section class="card" id="c-job" aria-live="polite" hidden></section>
   <section class="card" id="c-result" aria-labelledby="h-res" hidden></section>
   <section class="card" id="c-room" aria-labelledby="h-room2" hidden></section>
   <section class="card" id="c-check" aria-labelledby="h-chk" hidden></section>
+  <section class="card" id="c-levels" aria-labelledby="h-lvc" hidden></section>
   <div class="grid wide">
     <section class="card" aria-labelledby="h-chk"><h2 id="h-chk">Before you start</h2>
       <ul class="checks" id="c-checks"></ul>
@@ -414,13 +462,14 @@ const calibrate = {
     $("#c-micfile").addEventListener("change", uploadMic);
     $("#c-micdel").addEventListener("click", deleteMic);
     try {
-      const [mic, bass, job] = await Promise.all([api("/api/mic"), api("/api/bass"), api("/api/measure/job")]);
+      const [mic, bass, job, presets] = await Promise.all([api("/api/mic"), api("/api/bass"), api("/api/measure/job"), api("/api/presets")]);
       calState.mic = mic.calibration; calState.bass = bass.result; calState.bassOther = bass.other; calState.job = job;
+      calState.presets = presets;
       await loadRoomAndCheck();
       const room = calState.room;
       if (room.build) calState.target = room.build.target;
     } catch (_) { /* shown by the status pill */ }
-    renderMic(); renderResult(); renderRoom(); renderCheck(); renderJob();
+    renderMic(); renderPresets(); renderResult(); renderRoom(); renderCheck(); renderLevels(); renderJob();
     if (status) calibrate.update(status);
     if (calState.job?.state === "running") pollJob();
   },
@@ -463,7 +512,8 @@ async function startBass() {
         <li>Keep the room quiet and stay still.</li></ul>
       <p>First come two short, quiet test sounds: one on the main speakers, then one on the sub alone. PiDSP sets each speaker's sweep level from what the microphone hears, up to a safe maximum, and stops if a speaker is already loud at the quiet level.</p>
       <p>If anything sounds too loud, press Cancel.</p>
-      ${calState.mic ? "" : "<p style='color:var(--warn)'>No microphone calibration file yet. The bass setup still works.</p>"}`,
+      ${calState.mic ? "" : "<p style='color:var(--warn)'>No microphone calibration file yet. The bass setup still works.</p>"}
+      ${(calState.room?.positions || []).some((p) => p.current) ? `<p style='color:var(--warn)'>The positions in this preset were measured through its current bass setup; after a new bass measurement they must be measured again. To keep them, press Cancel and duplicate the preset first.</p>` : ""}`,
     ok: "Start",
   });
   if (ok) runBass(false);
@@ -483,8 +533,9 @@ async function runBass(selftest) {
 // Room positions, build and check of whichever bass result is shown (real or self-test).
 async function loadRoomAndCheck() {
   const sel = !!calState.bass?.selftest;
-  const [room, check] = await Promise.all([api(`/api/room?selftest=${sel}`), api(`/api/check?selftest=${sel}`)]);
-  calState.room = room; calState.check = check.result;
+  const [room, check, levels] = await Promise.all([api(`/api/room?selftest=${sel}`), api(`/api/check?selftest=${sel}`),
+    api(`/api/levelcheck?selftest=${sel}`)]);
+  calState.room = room; calState.check = check.result; calState.levels = levels.result;
 }
 
 async function showBass(selftest) {
@@ -492,7 +543,7 @@ async function showBass(selftest) {
   calState.bass = b.result; calState.bassOther = b.other;
   await loadRoomAndCheck();
   if (calState.room?.build) calState.target = calState.room.build.target;
-  renderResult(); renderRoom(); renderCheck();
+  renderResult(); renderRoom(); renderCheck(); renderLevels();
   if (status) calibrate.update(status);
 }
 
@@ -508,14 +559,16 @@ async function pollJob() {
   }
   if (calState.job?.state === "done") {
     const kind = calState.job.kind, roomJob = kind.startsWith("room"), checkJob = kind.startsWith("check");
+    const levelJob = kind.startsWith("levels");
     const sel = kind.endsWith("selftest");
-    if (!roomJob && !checkJob) {
+    if (!roomJob && !checkJob && !levelJob) {
       const b = await api(`/api/bass?selftest=${sel}`);
       calState.bass = b.result; calState.bassOther = b.other;
     }
     await loadRoomAndCheck();
-    renderResult(); renderRoom(); renderCheck();
-    $(checkJob ? "#c-check" : roomJob ? "#c-room" : "#c-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    calState.presets = await api("/api/presets").catch(() => calState.presets);
+    renderPresets(); renderResult(); renderRoom(); renderCheck(); renderLevels();
+    $(levelJob ? "#c-levels" : checkJob ? "#c-check" : roomJob ? "#c-room" : "#c-result")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
   if (status) calibrate.update(status);
 }
@@ -614,6 +667,95 @@ function renderResult() {
   $("#c-apply")?.addEventListener("click", applyBass);
 }
 
+// ---- presets: bundles of measurements and the filter built from them ----
+
+function presetSummary(p) {
+  const parts = [];
+  if (!p.bass_measured) return "Nothing measured yet";
+  parts.push(`bass ${fmtDate(p.bass_measured)} · ${p.crossover_hz} Hz`);
+  parts.push(p.positions.length ? `position${p.positions.length === 1 ? "" : "s"} ${p.positions.join(", ")}` : "no positions");
+  parts.push(p.build ? `${TARGET_NAMES[p.build.target]} filter built` : "no filter built");
+  return parts.join(" · ");
+}
+
+function renderPresets() {
+  const el = $("#c-presets");
+  if (!el) return;
+  const ps = calState.presets;
+  if (!ps) { el.hidden = true; return; }
+  el.hidden = false;
+  const busy = calState.job?.state === "running";
+  const dis = busy ? "disabled" : "";
+  const rows = ps.presets.map((p) => {
+    const open = p.id === ps.current, applied = p.id === ps.applied;
+    return `<div class="preset${open ? " open" : ""}">
+      <div style="min-width:0"><div style="font-weight:600;display:flex;gap:8px;align-items:center;flex-wrap:wrap">${esc(p.name)}
+        ${open ? `<span class="tag">Open</span>` : ""}${applied ? `<span class="tag" style="background:#16301F;color:var(--ok)">Playing${ps.applied_kind === "bass" ? " · bass only" : ""}</span>` : ""}</div>
+        <div class="muted small">${esc(presetSummary(p))}</div></div>
+      <div class="preset-actions">
+        ${open ? "" : `<button class="btn" type="button" data-pact="open" data-pid="${p.id}" ${dis}>Open</button>`}
+        ${p.bass_measured ? `<button class="btn" type="button" data-pact="apply" data-pid="${p.id}" ${dis}>${applied ? "Apply again" : "Apply"}</button>` : ""}
+        <button class="btn" type="button" data-pact="copy" data-pid="${p.id}" ${dis} title="A copy with the same measurements, to try something without losing this one">Duplicate</button>
+        <button class="btn" type="button" data-pact="rename" data-pid="${p.id}" ${dis}>Rename</button>
+        ${open ? "" : `<button class="btn" type="button" data-pact="delete" data-pid="${p.id}" ${dis}>Delete</button>`}
+      </div></div>`;
+  }).join("");
+  el.innerHTML = `
+    <div class="card-head"><h2 id="h-pre">Presets</h2><button class="btn" type="button" data-pact="new" ${dis}>New preset</button></div>
+    <p class="muted small" style="margin:0">Each preset keeps its own bass measurement, microphone positions and filter. New measurements go into the open preset. Apply any preset to listen to it.</p>
+    <div class="presets">${rows}</div>
+    <span class="msg" id="c-pmsg" role="status"></span>`;
+  el.querySelectorAll("[data-pact]").forEach((b) => b.addEventListener("click", () => presetAction(b.dataset.pact, b.dataset.pid)));
+}
+
+async function presetAction(act, pid) {
+  const ps = calState.presets, p = ps.presets.find((x) => x.id === pid);
+  const msg = $("#c-pmsg");
+  try {
+    let r = null;
+    if (act === "new") {
+      const name = await promptDialog({ title: "New preset", label: "Name", ok: "Create",
+        text: "<p>An empty preset: measure the bass setup and the positions again. To keep some measurements, duplicate a preset instead.</p>" });
+      if (!name) return;
+      r = await api("/api/presets", { method: "POST", body: JSON.stringify({ name }) });
+    } else if (act === "copy") {
+      const name = await promptDialog({ title: `Duplicate “${p.name}”`, label: "Name of the copy", value: `${p.name} (copy)`, ok: "Duplicate",
+        text: "<p>The copy has the same measurements and filter, and opens. Measure or replace positions, or build with another target, without changing the original.</p>" });
+      if (!name) return;
+      r = await api("/api/presets", { method: "POST", body: JSON.stringify({ name, copy_from: pid }) });
+    } else if (act === "rename") {
+      const name = await promptDialog({ title: "Rename preset", label: "Name", value: p.name, ok: "Rename" });
+      if (!name) return;
+      r = await api(`/api/presets/${pid}`, { method: "PUT", body: JSON.stringify({ name }) });
+    } else if (act === "delete") {
+      if (!(await confirmDialog({ title: `Delete “${p.name}”?`, danger: true, ok: "Delete",
+        text: `<p>Its measurements and filter are removed.${pid === ps.applied ? " What is playing now keeps playing until you apply something else." : ""}</p>` }))) return;
+      r = await api(`/api/presets/${pid}`, { method: "DELETE" });
+    } else if (act === "open") {
+      r = await api(`/api/presets/${pid}/select`, { method: "POST" });
+    } else if (act === "apply") {
+      const room = !!p.build;
+      if (!(await confirmDialog({ title: `Apply “${p.name}”?`, ok: "Apply",
+        text: `<p>${room ? `Plays its bass setup and its ${TARGET_NAMES[p.build.target]} room correction.` : "It has no room correction yet: plays its bass setup only."} When you have finished, run Wireless Audio Sync again on the Apple TV if the timing changed.</p>` }))) return;
+      r = await api(`/api/presets/${pid}/apply`, { method: "POST" });
+      await poll();
+    }
+    calState.presets = { presets: r.presets, current: r.current, applied: r.applied, applied_kind: r.applied_kind };
+    if (act === "new" || act === "copy" || act === "open") {
+      const b = await api("/api/bass?selftest=false");
+      calState.bass = b.result; calState.bassOther = b.other;
+      await loadRoomAndCheck();
+      calState.target = calState.room?.build?.target || calState.target;
+    }
+    renderPresets(); renderResult(); renderRoom(); renderCheck(); renderLevels();
+    if (status) calibrate.update(status);
+  } catch (e) { if (msg) { msg.className = "msg bad"; msg.textContent = e.message; } }
+}
+
+function warnNotes(list) {
+  return (list || []).map((w) => `<p class="note" style="color:var(--warn);margin:0">${esc(w)}</p>`).join("");
+}
+
 function renderRoom() {
   const el = $("#c-room");
   if (!el) return;
@@ -623,10 +765,17 @@ function renderRoom() {
   const selftest = !!r.selftest;
   const current = new Set(room.positions.filter((p) => p.current).map((p) => p.index));
   const n = room.recommended;
-  const next = Array.from({ length: n }, (_, i) => i + 1).find((i) => !current.has(i));
+  const next = Array.from({ length: room.max || n }, (_, i) => i + 1).find((i) => !current.has(i) && (i <= n || current.size >= n));
   const busy = calState.job?.state === "running";
-  const chips = Array.from({ length: n }, (_, i) => i + 1).map((i) =>
-    `<span class="tag" style="font-size:12px;padding:6px 10px;${current.has(i) ? "background:#16301F;color:var(--ok)" : ""}">${current.has(i) ? "✓ " : ""}Position ${i}</span>`).join("");
+  const max = room.max || n;
+  const stale = new Set(room.positions.filter((p) => !p.current).map((p) => p.index));
+  const shown = Math.min(max, Math.max(n, ...current, ...stale) + (current.size >= n ? 1 : 0));
+  const chips = Array.from({ length: shown }, (_, i) => i + 1).map((i) => {
+    const has = current.has(i), old = stale.has(i);
+    const look = has ? "background:#16301F;color:var(--ok)" : old ? "color:var(--warn)" : "";
+    const what = has ? "measured: measure again or remove" : old ? "measured for another bass setup: measure again" : "not measured: measure";
+    return `<button type="button" class="tag poschip" data-pos="${i}" style="${look}" ${busy ? "disabled" : ""} aria-label="Position ${i}, ${what}" title="${what}">${has ? "✓ " : old ? "! " : ""}Position ${i}</button>`;
+  }).join("");
   const b = room.build && room.build.selftest === selftest ? room.build : null;
   const side = calState.roomSide;
   let built = "";
@@ -646,18 +795,20 @@ function renderRoom() {
       <div class="tiles">
         <div class="tile"><div class="k">Deviation before</div><div class="v">±${sd.deviation_before_db.toFixed(1)} dB</div><div class="k">40 Hz – 16 kHz, 90 % of the band</div></div>
         <div class="tile"><div class="k">Predicted after</div><div class="v" style="color:var(--ok)">±${sd.deviation_after_db.toFixed(1)} dB</div><div class="k">dips are only half filled, on purpose</div></div>
-        ${b.bass_lift_db != null ? `<div class="tile"><div class="k">Sub level</div><div class="v">${fmtDb(b.bass_lift_db)}</div><div class="k">brings the sub's range to the target</div></div>` : ""}
+        ${b.bass_lift_db != null ? `<div class="tile"><div class="k">Sub level</div><div class="v"${(b.warnings || []).length ? ` style="color:var(--warn)"` : ""}>${fmtDb(b.bass_lift_db)}</div><div class="k">${b.bass_lift_wanted_db != null && Math.abs(b.bass_lift_wanted_db - b.bass_lift_db) >= 1 ? `the target needs ${fmtDb(b.bass_lift_wanted_db)}` : "brings the sub's range to the target"}</div></div>` : ""}
         <div class="tile"><div class="k">Headroom</div><div class="v">${fmtDb(b.preamp_db)}</div><div class="k">preamp, so boosts can't clip</div></div>
         <div class="tile"><div class="k">Built from</div><div class="v">${b.positions}</div><div class="k">mic position${b.positions === 1 ? "" : "s"} · ${TARGET_NAMES[b.target]} target</div></div>
       </div>
+      ${warnNotes(b.warnings)}
       ${selftest ? "" : `<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
         <button class="btn primary" type="button" id="c-rapply">Apply room correction</button>
         <span class="muted small">Replaces the current setup with the bass setup plus this correction.</span></div>`}`;
   }
   el.innerHTML = `
     <div class="card-head"><h2 id="h-room2">Room correction</h2>${selftest ? `<span class="tag">Self-test · simulated speakers</span>` : ""}</div>
-    <p class="muted small" style="margin:0">Measures left + sub and right + sub through the bass setup at up to ${n} microphone positions around your seat (see the diagram below). More positions give a correction that holds for a wider area. About 25 seconds each.</p>
+    <p class="muted small" style="margin:0">Measures left + sub and right + sub through the bass setup at microphone positions around your seat (see the diagram below): ${n} recommended, up to ${max}. More positions give a correction that holds for a wider area. About 25 seconds each. Measure them in any order, over several sessions; click a position to measure it again or remove it. Position 1 is the main seat.</p>
     <div style="display:flex;flex-wrap:wrap;gap:8px">${chips}</div>
+    ${warnNotes(room.positions.filter((p) => p.current).flatMap((p) => (p.warnings || []).map((w) => `Position ${p.index}: ${w}`)))}
     <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
       <button class="btn${b ? "" : " primary"}" type="button" id="c-rmeasure" ${busy ? "disabled" : ""}>${next ? `Measure position ${next}` : "All positions measured"}</button>
       ${current.size ? `<button class="btn" type="button" id="c-rclear" ${busy ? "disabled" : ""}>Start over</button>` : ""}
@@ -669,6 +820,7 @@ function renderRoom() {
     ${built}`;
   if (next === undefined) $("#c-rmeasure").disabled = true;
   $("#c-rmeasure")?.addEventListener("click", () => measureRoom(next, selftest));
+  el.querySelectorAll("[data-pos]").forEach((x) => x.addEventListener("click", () => positionAction(Number(x.dataset.pos), current.has(Number(x.dataset.pos)), selftest)));
   $("#c-rclear")?.addEventListener("click", async () => {
     if (!(await confirmDialog({ title: "Start over?", text: "Removes the room correction measurements. What is applied stays.", ok: "Start over", danger: true }))) return;
     await api(`/api/room?selftest=${!!calState.bass?.selftest}`, { method: "DELETE" });
@@ -678,6 +830,48 @@ function renderRoom() {
   el.querySelectorAll("[data-rside]").forEach((x) => x.addEventListener("click", () => { calState.roomSide = x.dataset.rside; renderRoom(); }));
   $("#c-rbuild")?.addEventListener("click", buildRoom);
   $("#c-rapply")?.addEventListener("click", applyRoom);
+}
+
+async function positionAction(position, measured, selftest) {
+  if (!measured) return measureRoom(position, selftest);
+  const dlg = await choiceDialog({ title: `Position ${position}`,
+    text: "<p>Measure it again (the new measurement replaces this one), or remove it from the correction.</p>",
+    choices: [["measure", "Measure again", "primary"], ["remove", "Remove", "danger"]] });
+  if (dlg === "measure") return measureRoom(position, selftest);
+  if (dlg === "remove") {
+    try {
+      await api(`/api/room/position/${position}?selftest=${selftest}`, { method: "DELETE" });
+      await loadRoomAndCheck();
+      calState.presets = await api("/api/presets").catch(() => calState.presets);
+      renderPresets(); renderRoom(); renderCheck();
+      const m = $("#c-rmsg"); if (m) { m.className = "msg"; m.textContent = `Position ${position} removed. Build again to update the correction.`; }
+    } catch (e) { set("c-hint", `<span style="color:var(--bad)">${esc(e.message)}</span>`); }
+  }
+}
+
+// Two (or more) actions plus Cancel. Resolves the chosen key, or null.
+function choiceDialog({ title, text, choices }) {
+  const dlg = $("#dlg"), okBtn = $("#dlg-ok");
+  $("#dlg-q").textContent = title;
+  $("#dlg-t").innerHTML = text;
+  const extra = choices.slice(1).map(([k, label, kind]) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = `btn ${kind || ""}`; b.textContent = label; b.dataset.choice = k;
+    b.addEventListener("click", () => { dlg.returnValue = k; dlg.close(); });
+    okBtn.parentElement.insertBefore(b, okBtn);
+    return b;
+  });
+  const [k0, l0, kind0] = choices[0];
+  okBtn.textContent = l0; okBtn.className = `btn ${kind0 || "primary"}`;
+  dlg.returnValue = "";
+  dlg.showModal();
+  return new Promise((resolve) => {
+    dlg.onclose = () => {
+      extra.forEach((b) => b.remove());
+      const v = dlg.returnValue;
+      resolve(v === "ok" ? k0 : choices.some(([k]) => k === v) ? v : null);
+    };
+  });
 }
 
 async function measureRoom(position, selftest) {
@@ -751,6 +945,52 @@ function renderCheck() {
   el.querySelectorAll("[data-cside]").forEach((x) => x.addEventListener("click", () => { calState.checkSide = x.dataset.cside; renderCheck(); }));
 }
 
+const VERDICT_TITLES = { ok: "Levels as calibrated", sub_quieter: "The sub is quieter than calibrated",
+  sub_louder: "The sub is louder than calibrated", moved: "Check the microphone position", unsure: "Could not tell" };
+
+function renderLevels() {
+  const el = $("#c-levels");
+  if (!el) return;
+  const r = calState.bass;
+  if (!r || !r.level?.sub) { el.hidden = true; return; }
+  el.hidden = false;
+  const selftest = !!r.selftest, busy = calState.job?.state === "running";
+  const c = calState.levels && !!calState.levels.selftest === selftest && calState.levels.bass_measured === r.measured ? calState.levels : null;
+  const kind = c ? (c.verdict === "ok" ? "ok" : c.verdict.startsWith("sub") ? "bad" : "warn") : "";
+  const fmtChange = (v) => (v == null ? "unknown" : fmtDb(v));
+  el.innerHTML = `
+    <div class="card-head"><h2 id="h-lvc">Level check</h2>${selftest ? `<span class="tag">Self-test · simulated speakers</span>` : ""}</div>
+    <p class="muted small" style="margin:0">${selftest ? "Plays the quiet test sounds into the simulated speakers." : "Has the sub's own level changed since calibrating, in its app or on the sub? With the microphone at the main seat, this plays the two quiet test sounds from the bass setup again (about 5 seconds) and compares."}</p>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+      <button class="btn" type="button" id="c-lmeasure" ${busy ? "disabled" : ""}>${c ? "Check levels again" : "Check levels"}</button></div>
+    ${c ? `<div style="display:flex;gap:10px;align-items:flex-start">${dot(kind)}<div><div style="font-weight:600">${esc(VERDICT_TITLES[c.verdict] || c.verdict)}</div>
+        <div class="small">${esc(c.message)}</div></div></div>
+      <div class="tiles">
+        <div class="tile"><div class="k">Sub</div><div class="v"${kind === "bad" ? ` style="color:var(--warn)"` : ""}>${fmtChange(c.sub_change_db)}</div><div class="k">since calibrating</div></div>
+        <div class="tile"><div class="k">Main speakers</div><div class="v">${fmtChange(c.mains_change_db)}</div><div class="k">${c.volume_change_db != null && c.volume_change_db !== 0 ? `allowing for the volume (${fmtDb(c.volume_change_db)})` : "since calibrating"}</div></div>
+      </div>
+      <div class="muted small">Checked ${esc(fmtDate(c.measured))}</div>` : ""}`;
+  $("#c-lmeasure").addEventListener("click", () => measureLevels(selftest));
+}
+
+async function measureLevels(selftest) {
+  if (!selftest) {
+    const ok = await confirmDialog({
+      title: "Check the levels?",
+      text: "<p>Put the microphone at the main seat, where the bass setup was measured, pointing at the ceiling, and keep quiet. Two quiet test sounds play: the main speakers, then the sub.</p>",
+      ok: "Check",
+    });
+    if (!ok) return;
+  }
+  try {
+    calState.job = await api("/api/measure/levelcheck", { method: "POST", body: JSON.stringify({ selftest }) });
+    renderJob(); renderLevels();
+    pollJob();
+  } catch (e) {
+    set("c-hint", `<span style="color:var(--bad)">${esc(e.message)}</span>`);
+  }
+}
+
 async function measureCheck(selftest) {
   if (!selftest) {
     const ok = await confirmDialog({
@@ -789,7 +1029,9 @@ async function applyRoom() {
 async function applyBass() {
   const ok = await confirmDialog({
     title: "Apply this bass setup?",
-    text: "<p>It replaces the current sound setup straight away. When you have finished calibrating, run Wireless Audio Sync again on the Apple TV.</p>",
+    text: (status?.calibration?.kind === "room"
+      ? "<p><b>This removes the room correction that is applied now.</b> Only the bass setup (crossover, delays and sub level) stays. To get the correction back, apply it again under Room correction.</p>"
+      : "") + "<p>It replaces the current sound setup straight away. When you have finished calibrating, run Wireless Audio Sync again on the Apple TV.</p>",
     ok: "Apply",
   });
   if (!ok) return;

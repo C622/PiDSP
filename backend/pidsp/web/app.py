@@ -27,7 +27,7 @@ from ..dsp.calibration import MeasurementError
 from ..guard import BitstreamGuard
 from ..measure import runner
 from ..measure.jobs import Busy, JobRunner
-from ..store import ACTIVE_CONFIG, COMPARE_CONFIG, Store
+from ..store import ACTIVE_CONFIG, COMPARE_CONFIG, PresetError, Store
 from ..volume import SUB_LEVEL_RANGE, VolumeFollower
 
 STATIC = Path(__file__).parent / "static"
@@ -86,13 +86,22 @@ class CrossoverChoice(BaseModel):
 
 
 class RoomMeasure(BaseModel):
-    position: int = Field(ge=1, le=9)
+    position: int = Field(ge=1, le=room.MAX_POSITIONS)
     selftest: bool = False
 
 
 class RoomBuild(BaseModel):
     target: str = "room"
     selftest: bool = False
+
+
+class PresetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    copy_from: str | None = Field(default=None, max_length=32)
+
+
+class PresetRename(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
 
 
 class CheckRequest(BaseModel):
@@ -154,7 +163,17 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
         active = st.active()
         if not active:
             return None
-        return {k: active[k] for k in ("applied", "kind", "plan", "room") if k in active}
+        return {k: active[k] for k in ("applied", "kind", "plan", "room", "preset") if k in active}
+
+    def level_check_summary() -> dict | None:
+        """The last level check of the current bass calibration, if any."""
+        if not st.preset_ids():  # read-only: nothing set up yet
+            return None
+        d = data(False)
+        lc, bass = d.level_check(), d.bass()
+        if not lc or not bass or lc.get("bass_measured") != bass.get("measured"):
+            return None
+        return {k: lc.get(k) for k in ("verdict", "message", "sub_change_db", "measured")}
 
     @app.get("/api/status")
     async def status():
@@ -167,6 +186,7 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
             "measuring": jr.running(),
             "volume": follower.summary(),
             "guard": guard.summary(),
+            "level_check": level_check_summary(),
         }
 
     @app.get("/api/levels")
@@ -236,16 +256,19 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
 
     # Self-test results live apart from the real ones, so running the silent
     # self-test can never replace a measurement of the room.
-    st_self = Store(st.root / "selftest", st.camilla_dir)
+    st_self = Store(st.root / "selftest", st.camilla_dir, data_dir=st.root / "selftest")
 
     def data(selftest: bool) -> Store:
-        return st_self if selftest else st
+        """The self-test's data, or the current preset's (a store bound to it,
+        so a job keeps writing to the preset it started in)."""
+        return st_self if selftest else st.preset_store(st.current_preset())
 
     @app.post("/api/measure/bass", status_code=202)
     async def measure_bass(body: BassRequest):
         rig = await ready_rig(body.selftest)
         mic_curve = None if body.selftest else st.mic_curve()
         reference = None if body.selftest else player_reference()
+        d = data(body.selftest)
 
         def work(progress, cancel):
             with runner.Session(cam, st.config_dir, progress, cancel) as session:
@@ -256,7 +279,7 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
                       "curves": runner.curves(out["responses"], out["plan"])}
             if body.selftest:
                 result["verdict"] = runner.selftest_verdict(out["plan"])
-            return data(body.selftest).save_bass(result, out["responses"])
+            return d.save_bass(result, out["responses"])
 
         try:
             return jr.start("selftest" if body.selftest else "bass", work)
@@ -267,7 +290,7 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
     def bass_result(selftest: bool | None = None):
         """The real or the self-test bass result; without `selftest`, the more
         recent of the two. `other` tells whether the other one exists."""
-        real, self_ = st.bass(), st_self.bass()
+        real, self_ = data(False).bass(), st_self.bass()
         if selftest is None:
             selftest = bool(self_) and (not real or self_.get("measured", "") > real.get("measured", ""))
         return {"result": self_ if selftest else real, "other": bool(real if selftest else self_)}
@@ -290,23 +313,35 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
             result["verdict"] = runner.selftest_verdict(plan)
         return {"result": d.update_bass(result)}
 
-    @app.post("/api/bass/apply")
-    async def apply_bass():
+    async def apply_from(d: Store, kind: str) -> dict:
+        """Apply a preset's bass setup ("bass") or its room correction ("room")."""
         if jr.running():
             raise HTTPException(409, "Wait for the measurement to finish.")
-        result = st.bass()
-        if not result:
+        bass = d.bass()
+        if not bass:
             raise HTTPException(409, "Measure the bass setup first.")
-        if result.get("selftest"):
-            raise HTTPException(409, "That plan comes from the self-test with simulated speakers, not your room.")
-        path = await asyncio.to_thread(st.apply_bass, result["plan"])
+        if kind == "room":
+            build = d.room_build()
+            if not build:
+                raise HTTPException(409, "Build the room correction first.")
+            if build.get("selftest"):
+                raise HTTPException(409, "That correction comes from the self-test with simulated speakers, not your room.")
+            path = await asyncio.to_thread(d.apply_room)
+        else:
+            if bass.get("selftest"):
+                raise HTTPException(409, "That plan comes from the self-test with simulated speakers, not your room.")
+            path = await asyncio.to_thread(d.apply_bass, bass["plan"])
         try:
             await cam.call("SetConfigFilePath", str(path))
             await cam.call("Reload")
         except (CamillaError, OSError) as e:
             raise HTTPException(502, f"Saved, but CamillaDSP did not load it: {e}") from e
-        await use_reference_of(result)
+        await use_reference_of(bass)
         return {"calibration": calibration_summary()}
+
+    @app.post("/api/bass/apply")
+    async def apply_bass():
+        return await apply_from(data(False), "bass")
 
     # ---- room correction ----
 
@@ -331,6 +366,7 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
                            "warnings": p.get("warnings", []), "current": p["index"] in current}
                           for p in d.positions()],
             "recommended": room.RECOMMENDED_POSITIONS,
+            "max": room.MAX_POSITIONS,
             "build": d.room_build(),
             "targets": list(room.TARGETS),
         }
@@ -341,19 +377,35 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
             raise HTTPException(409, "Wait for the measurement to finish.")
         data(selftest).clear_room()
 
+    @app.delete("/api/room/position/{index}", status_code=204)
+    def delete_position(index: int, selftest: bool = False):
+        if jr.running():
+            raise HTTPException(409, "Wait for the measurement to finish.")
+        if not data(selftest).delete_position(index):
+            raise HTTPException(404, f"Position {index} has not been measured.")
+
     @app.post("/api/measure/room", status_code=202)
     async def measure_room(body: RoomMeasure):
         bass = room_basis(body.selftest)
         rig = await ready_rig(body.selftest)
         mic_curve = None if body.selftest else st.mic_curve()
         plan, level = bass["plan"], bass["level"]["sweep_db"]
+        d = data(body.selftest)
 
         def work(progress, cancel):
             with runner.Session(cam, st.config_dir, progress, cancel) as session:
                 progress("Loading the measurement setup", 0.05)
                 m = runner.measure_position(session, rig, plan, level, mic_curve)
+            if body.position == 1:  # the main seat, where the bass setup was measured
+                responses = d.bass_responses()
+                if responses:
+                    change = room.bass_change_db(m, responses, plan)
+                    m["bass_change_db"] = change
+                    w = room.bass_change_warning(change, "At the main seat")
+                    if w:
+                        m["warnings"].append(w)
             progress("Saving", 0.97)
-            data(body.selftest).save_position(body.position, m, plan, body.selftest)
+            d.save_position(body.position, m, plan, body.selftest)
             return {"position": body.position, "warnings": m["warnings"]}
 
         try:
@@ -376,7 +428,9 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
         summary = {
             "target": result["target"], "positions": result["positions"], "preamp_db": result["preamp_db"],
             # The bass plan with the sub level corrected (bass_lift_db) as part of the room correction.
-            "plan": result["plan"], "bass_lift_db": result["bass_lift_db"], "selftest": body.selftest,
+            "plan": result["plan"], "bass_lift_db": result["bass_lift_db"],
+            "bass_lift_wanted_db": result["bass_lift_wanted_db"], "warnings": result["warnings"],
+            "selftest": body.selftest,
             "sides": {side: {k: v for k, v in s.items() if k.endswith("_db") or k == "knee_hz"}
                       for side, s in result["sides"].items()},
             "curves": room.curves_for_ui(result),
@@ -385,21 +439,7 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
 
     @app.post("/api/room/apply")
     async def apply_room():
-        if jr.running():
-            raise HTTPException(409, "Wait for the measurement to finish.")
-        build = st.room_build()
-        if not build:
-            raise HTTPException(409, "Build the room correction first.")
-        if build.get("selftest"):
-            raise HTTPException(409, "That correction comes from the self-test with simulated speakers, not your room.")
-        path = await asyncio.to_thread(st.apply_room)
-        try:
-            await cam.call("SetConfigFilePath", str(path))
-            await cam.call("Reload")
-        except (CamillaError, OSError) as e:
-            raise HTTPException(502, f"Saved, but CamillaDSP did not load it: {e}") from e
-        await use_reference_of(st.bass() or {})
-        return {"calibration": calibration_summary()}
+        return await apply_from(data(False), "room")
 
     @app.post("/api/compare")
     async def compare(body: Compare):
@@ -433,6 +473,9 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
             active = st.active() or {}
             if active.get("kind") != "room":
                 raise HTTPException(409, "Apply the room correction first.")
+            applied_preset = (active.get("preset") or {}).get("id")
+            if applied_preset and applied_preset != d.preset_id:
+                raise HTTPException(409, "Another preset is applied. Apply this preset's room correction, then check.")
             if build.get("built") != active.get("room", {}).get("built", build.get("built")):
                 raise HTTPException(409, "The last built correction is not the one applied. Apply it, then check.")
         bass = room_basis(body.selftest)
@@ -448,9 +491,10 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
                 m = runner.measure_position(session, rig, plan, level, mic_curve, fir=fir,
                                             preamp_db=build["preamp_db"])
             progress("Saving", 0.97)
-            result = room.check(m, build["target"], before=before, predicted=build.get("curves"))
+            result = room.check(m, build["target"], before=before, predicted=build.get("curves"),
+                                crossover_hz=plan["crossover_hz"])
             result.update({"selftest": body.selftest, "compared_with_position": 1 if before else None,
-                           "built": build.get("built"), "warnings": m["warnings"]})
+                           "built": build.get("built"), "warnings": m["warnings"] + result["warnings"]})
             return d.save_check(result)
 
         try:
@@ -461,6 +505,92 @@ def create_app(camilla: CamillaClient | None = None, store: Store | None = None,
     @app.get("/api/check")
     def check_result(selftest: bool = False):
         return {"result": data(selftest).check()}
+
+    # ---- presets ----
+
+    def presets_state() -> dict:
+        active = st.active() or {}
+        return {"presets": st.presets(), "current": st.current_preset(),
+                "applied": (active.get("preset") or {}).get("id"), "applied_kind": active.get("kind")}
+
+    def preset_call(fn, *args):
+        if jr.running():
+            raise HTTPException(409, "Wait for the measurement to finish.")
+        try:
+            return fn(*args)
+        except PresetError as e:
+            raise HTTPException(404 if "No such" in str(e) else 409, str(e)) from e
+
+    @app.get("/api/presets")
+    def presets():
+        return presets_state()
+
+    @app.post("/api/presets", status_code=201)
+    def create_preset(body: PresetCreate):
+        """A new, empty preset, or a copy of one (copy_from); it becomes current."""
+        pid = preset_call(st.create_preset, body.name, body.copy_from)
+        st.select_preset(pid)
+        return presets_state()
+
+    @app.post("/api/presets/{pid}/select")
+    def select_preset(pid: str):
+        preset_call(st.select_preset, pid)
+        return presets_state()
+
+    @app.put("/api/presets/{pid}")
+    def rename_preset(pid: str, body: PresetRename):
+        preset_call(st.rename_preset, pid, body.name)
+        return presets_state()
+
+    @app.delete("/api/presets/{pid}")
+    def delete_preset(pid: str):
+        preset_call(st.delete_preset, pid)
+        return presets_state()
+
+    @app.post("/api/presets/{pid}/apply")
+    async def apply_preset(pid: str):
+        """Apply a preset: its room correction if it has one, else its bass setup."""
+        d = preset_call(st.preset_store, pid)
+        out = await apply_from(d, "room" if d.room_build() else "bass")
+        return {**out, **presets_state()}
+
+    # ---- level check ----
+
+    @app.post("/api/measure/levelcheck", status_code=202)
+    async def measure_level_check(body: CheckRequest):
+        """Two quiet probes, compared with the bass setup measurement: catches
+        a sub (or amplifier) whose level was changed after calibrating."""
+        bass = room_basis(body.selftest)
+        if not (bass.get("level") or {}).get("sub"):
+            raise HTTPException(409, "Measure the bass setup again first: this one has no level of the sub to compare with.")
+        rig = await ready_rig(body.selftest)
+        volume_change = None
+        if not body.selftest:
+            player = follower.player
+            ref = (bass.get("player") or {}).get("db")
+            if ref is None:
+                ref = st.settings().get("reference_db")
+            if player is not None and player.db is not None and ref is not None:
+                volume_change = round(player.db - ref, 1)
+        else:
+            volume_change = 0.0
+        d = data(body.selftest)
+
+        def work(progress, cancel):
+            with runner.Session(cam, st.config_dir, progress, cancel) as session:
+                now = runner.level_check(session, rig)
+            result = runner.compare_levels(now, bass["level"], volume_change)
+            result.update({"level": now, "selftest": body.selftest, "bass_measured": bass.get("measured")})
+            return d.save_level_check(result)
+
+        try:
+            return jr.start("levels-selftest" if body.selftest else "levels", work)
+        except Busy as e:
+            raise HTTPException(409, str(e)) from e
+
+    @app.get("/api/levelcheck")
+    def level_check_result(selftest: bool = False):
+        return {"result": data(selftest).level_check()}
 
     # ---- volume ----
 

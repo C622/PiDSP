@@ -163,3 +163,15 @@ dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top
   .nav a { padding: 8px 10px; }
   .big { font-size: 32px; }
 }
+
+/* presets */
+.presets { display: flex; flex-direction: column; gap: 8px; }
+.preset { display: flex; flex-wrap: wrap; gap: 10px 16px; justify-content: space-between; align-items: center;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--inset); }
+.preset.open { border-color: var(--after); }
+.preset-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.preset-actions .btn { padding: 6px 10px; font-size: 13px; }
+.poschip { font-size: 12px; padding: 6px 10px; border: 0; cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
+.poschip:hover:not(:disabled) { outline: 1px solid currentColor; }
+.poschip:disabled { cursor: default; opacity: .6; }
+.field select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--inset); }
